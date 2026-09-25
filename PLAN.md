@@ -11,3 +11,8 @@ The second iteration emphasizes the recognizable high-level language of a 2D arc
 ## Verification
 
 The live HUD must update while the fight runs; attacks must create sparks and knockback; the combo badge must appear above two hits; the generated rooftop must remain behind the Babylon actors; the desktop and narrow viewport must keep the HUD readable; `?demo` must create deterministic attacks; `pnpm check` and `pnpm build` must pass.
+
+
+## DC vs Wizz demo update
+
+The demo matchup is now DC versus Wizz. DC uses ten transparent frames extracted from the user-supplied blue-shirt sprite sheet, while Wizz uses an original transparent BMX-fighter cutout. The logo cell in the supplied sheet is excluded during deterministic extraction.

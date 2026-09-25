@@ -20,3 +20,6 @@
 ## Runtime assignments
 
 The rooftop art is rendered as a Babylon background plane behind the fighters and also anchors the page frame. Toto and Crater now render with their transparent illustrated cutouts over procedural hitboxes. Wero and Miguel are represented in the assist-ready UI and are ready for a later tag-slot expansion. The fighter lineup and character-select art guide the portrait cards. The HUD reference guides the React overlay.
+
+| dc-animation-frames | Ten 192x192 transparent frames extracted from the supplied DC sheet | Managed storage `dc-00` through `dc-09` |
+| wizz-cutout | Original transparent Wizz BMX-fighter cutout for the CPU side | `/manus-storage/wizz-cutout_8367d3ff.png` |

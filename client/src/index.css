@@ -16,8 +16,8 @@ canvas { display: block; z-index: 1; }
 .team-copy strong { color: #fff; font-size: clamp(17px, 2vw, 27px); letter-spacing: .08em; font-style: italic; }
 .team-copy span, .health-label, .meter-row span { font: 700 9px Arial, sans-serif; letter-spacing: .12em; color: #bfe9ff; }
 .portrait { width: 54px; height: 54px; flex: 0 0 54px; border: 3px solid #f8d34b; display: grid; place-items: center; font-size: 32px; font-style: italic; color: #fff; transform: skewX(-9deg); box-shadow: 0 0 16px rgba(248,211,75,.55); }
-.portrait-toto { background: linear-gradient(145deg, #9b5cff, #26164c); }
-.portrait-crater { background: linear-gradient(145deg, #ff4fba, #3a133d); }
+.portrait-dc { background: linear-gradient(145deg, #2378ff, #11265e); }
+.portrait-wizz { background: linear-gradient(145deg, #c75cff, #3a133d); }
 .health-stack { padding-top: 3px; }
 .health-row, .meter-row { display: flex; align-items: center; gap: 8px; }
 .health-row { height: 25px; }
