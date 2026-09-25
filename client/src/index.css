@@ -5,7 +5,7 @@
 * { box-sizing: border-box; }
 html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #050619; }
 body { touch-action: none; }
-.arcade-frame { width: 100%; height: 100%; position: relative; overflow: hidden; background-image: linear-gradient(rgba(5,6,25,.55), rgba(5,6,25,.86)), url("/manus-storage/stage-neon-rooftop_337b0a75.png"); background-size: cover; background-position: center; }
+.arcade-frame { width: 100%; height: 100%; position: relative; overflow: hidden; background: radial-gradient(circle at 50% 25%, #26315f 0%, #111532 38%, #050619 78%); }
 .arcade-frame::before { content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 5; background: repeating-linear-gradient(0deg, rgba(255,255,255,.02) 0 1px, transparent 1px 4px); mix-blend-mode: screen; opacity: .35; }
 canvas { display: block; z-index: 1; }
 .arcade-ui { position: fixed; inset: 0; z-index: 4; pointer-events: none; user-select: none; }
@@ -38,12 +38,13 @@ canvas { display: block; z-index: 1; }
 .combo-badge { position: absolute; left: 8%; top: 42%; display: flex; align-items: center; gap: 7px; color: #f8d34b; transform: rotate(-7deg); text-shadow: 3px 3px 0 #59152f, 0 0 13px #ff8c00; }
 .combo-badge b { font-size: clamp(38px, 6vw, 72px); font-style: italic; }
 .combo-badge span { font: 900 13px Arial, sans-serif; letter-spacing: .16em; }
-.arcade-controls { position: absolute; left: 0; right: 0; bottom: 14px; display: flex; align-items: end; justify-content: space-between; padding: 0 28px; }
-.dpad, .attack-pad { display: flex; gap: 8px; pointer-events: auto; }
-.dpad button, .attack-pad button { width: 52px; height: 42px; border: 2px solid #7cf2ff; color: #d7fbff; background: linear-gradient(145deg, rgba(20,42,90,.94), rgba(9,11,36,.94)); box-shadow: 0 0 10px rgba(34,211,238,.4), inset 0 0 12px rgba(34,211,238,.15); font: 900 21px Arial; cursor: pointer; }
-.attack-pad button { width: 57px; height: 57px; border-radius: 50%; border-color: #ff76d4; color: #fff; font-size: 24px; }
-.attack-pad button small { display: block; font: 800 7px Arial; letter-spacing: .08em; }
-.attack-pad .heavy { border-color: #f8d34b; box-shadow: 0 0 13px rgba(248,211,75,.45); }
-.attack-pad .special { border-color: #c75cff; box-shadow: 0 0 16px rgba(199,92,255,.6); }
-.control-hints { display: flex; gap: 12px; color: #bfe9ff; font: 800 9px Arial; letter-spacing: .08em; opacity: .9; }
-@media (max-width: 760px) { .arcade-topbar { padding: 8px 8px 0; grid-template-columns: 88px 1fr 50px 1fr 88px; gap: 5px; height: 83px; } .team-copy span, .health-label, .meter-row span, .control-hints, .assist-chip { display: none; } .portrait { width: 37px; height: 37px; flex-basis: 37px; font-size: 22px; } .team-copy strong { font-size: 13px; } .round-timer { font-size: 32px; } .assist-row { margin-top: 0; gap: 8px; } .series-mark { font-size: 17px; } .arcade-controls { padding: 0 9px; bottom: 8px; } .dpad button { width: 42px; height: 36px; } .attack-pad button { width: 47px; height: 47px; } .combo-badge { left: 4%; top: 38%; } }
+.six-button-bar { position: absolute; left: 0; right: 0; bottom: 12px; display: grid; grid-template-columns: repeat(6, minmax(70px, 108px)); justify-content: center; gap: 10px; padding: 0 16px; pointer-events: auto; }
+.action-button { min-height: 64px; border: 2px solid #7cf2ff; color: #f4f8ff; background: linear-gradient(145deg, rgba(20,42,90,.96), rgba(9,11,36,.96)); box-shadow: 0 0 10px rgba(34,211,238,.4), inset 0 0 12px rgba(34,211,238,.15); cursor: pointer; font-family: Arial Black, sans-serif; transform: skewX(-7deg); transition: transform .1s ease, filter .1s ease; }
+.action-button:active { transform: skewX(-7deg) scale(.95); filter: brightness(1.35); }
+.action-button b, .action-button small { display: block; transform: skewX(7deg); }
+.action-button b { font-size: 24px; line-height: 1; }
+.action-button small { margin-top: 6px; font: 800 9px Arial, sans-serif; letter-spacing: .08em; }
+.action-2, .action-4 { border-color: #f8d34b; }
+.action-3, .action-5 { border-color: #ff76d4; }
+.action-6 { border-color: #c75cff; }
+@media (max-width: 760px) { .arcade-topbar { padding: 8px 8px 0; grid-template-columns: 88px 1fr 50px 1fr 88px; gap: 5px; height: 83px; } .team-copy span, .health-label, .meter-row span, .control-hints, .assist-chip { display: none; } .portrait { width: 37px; height: 37px; flex-basis: 37px; font-size: 22px; } .team-copy strong { font-size: 13px; } .round-timer { font-size: 32px; } .assist-row { margin-top: 0; gap: 8px; } .series-mark { font-size: 17px; } .six-button-bar { grid-template-columns: repeat(6, 1fr); gap: 4px; padding: 0 6px; bottom: 7px; } .action-button { min-height: 53px; } .action-button small { font-size: 7px; } .combo-badge { left: 4%; top: 38%; } }
