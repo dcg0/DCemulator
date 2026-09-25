@@ -9,6 +9,18 @@ body { touch-action: none; }
 .arcade-frame::before { content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 5; background: repeating-linear-gradient(0deg, rgba(255,255,255,.02) 0 1px, transparent 1px 4px); mix-blend-mode: screen; opacity: .35; }
 canvas { display: block; z-index: 1; }
 .arcade-ui { position: fixed; inset: 0; z-index: 4; pointer-events: none; user-select: none; }
+.lab-card { pointer-events: auto; position: absolute; left: 24px; bottom: 96px; width: min(280px, 24vw); padding: 13px 15px 14px; border: 1px solid rgba(124,242,255,.78); border-left: 4px solid #f8d34b; background: linear-gradient(145deg, rgba(10,23,58,.96), rgba(8,8,28,.92)); box-shadow: 0 0 20px rgba(34,211,238,.2), inset 0 0 18px rgba(34,211,238,.08); transform: skewX(-4deg); color: #f4f8ff; text-decoration: none; cursor: pointer; transition: filter .16s ease, transform .16s ease; }
+.lab-card:hover { filter: brightness(1.18); transform: skewX(-4deg) translateY(-3px); }
+.lab-card > * { transform: skewX(4deg); }
+.lab-eyebrow { color: #bfe9ff; font: 900 9px Arial, sans-serif; letter-spacing: .16em; }
+.lab-logo { margin-top: 2px; color: #f8d34b; font: italic 900 clamp(22px, 3vw, 34px)/1 Impact, Arial Black, sans-serif; letter-spacing: .04em; text-shadow: 2px 2px 0 #d946ef, 0 0 12px rgba(248,211,75,.62); }
+.lab-logo span { color: #fff; }
+.lab-coming { margin-top: 8px; color: #ff76d4; font: 900 12px Arial Black, sans-serif; letter-spacing: .12em; }
+.lab-caption { margin-top: 3px; color: #7cf2ff; font: 800 9px Arial, sans-serif; letter-spacing: .15em; text-transform: uppercase; }
+.lab-features { display: grid; gap: 3px; margin-top: 9px; color: #d9e8ff; font: 800 8px/1.2 Arial, sans-serif; letter-spacing: .08em; }
+.lab-card p { margin: 8px 0 0; color: #d9e8ff; font: 600 10px/1.35 Arial, sans-serif; letter-spacing: .02em; }
+.lab-card p + p { margin-top: 2px; color: #f8d34b; }
+.lab-cta { display: block; margin-top: 9px; color: #7cf2ff; font: 900 8px Arial, sans-serif; letter-spacing: .1em; }
 .arcade-topbar { height: 112px; padding: 16px 24px 0; display: grid; grid-template-columns: 220px minmax(180px, 1fr) 76px minmax(180px, 1fr) 220px; align-items: start; gap: 12px; text-shadow: 0 3px 0 #071022, 0 0 12px rgba(34,211,238,.75); }
 .team-block { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .right-team { justify-content: flex-end; text-align: right; }
@@ -47,4 +59,4 @@ canvas { display: block; z-index: 1; }
 .action-2, .action-4 { border-color: #f8d34b; }
 .action-3, .action-5 { border-color: #ff76d4; }
 .action-6 { border-color: #c75cff; }
-@media (max-width: 760px) { .arcade-topbar { padding: 8px 8px 0; grid-template-columns: 88px 1fr 50px 1fr 88px; gap: 5px; height: 83px; } .team-copy span, .health-label, .meter-row span, .control-hints, .assist-chip { display: none; } .portrait { width: 37px; height: 37px; flex-basis: 37px; font-size: 22px; } .team-copy strong { font-size: 13px; } .round-timer { font-size: 32px; } .assist-row { margin-top: 0; gap: 8px; } .series-mark { font-size: 17px; } .six-button-bar { grid-template-columns: repeat(6, 1fr); gap: 4px; padding: 0 6px; bottom: 7px; } .action-button { min-height: 53px; } .action-button small { font-size: 7px; } .combo-badge { left: 4%; top: 38%; } }
+@media (max-width: 760px) { .arcade-topbar { padding: 8px 8px 0; grid-template-columns: 88px 1fr 50px 1fr 88px; gap: 5px; height: 83px; } .lab-card { left: 8px; bottom: 72px; width: 190px; padding: 8px 9px; } .lab-eyebrow { font-size: 7px; } .lab-logo { font-size: 21px; } .lab-coming { margin-top: 5px; font-size: 8px; } .lab-caption, .lab-card p { font-size: 7px; } .lab-features { margin-top: 5px; font-size: 7px; } .lab-card p { margin-top: 4px; } .lab-cta { margin-top: 5px; font-size: 7px; } .team-copy span, .health-label, .meter-row span, .control-hints, .assist-chip { display: none; } .portrait { width: 37px; height: 37px; flex-basis: 37px; font-size: 22px; } .team-copy strong { font-size: 13px; } .round-timer { font-size: 32px; } .assist-row { margin-top: 0; gap: 8px; } .series-mark { font-size: 17px; } .six-button-bar { grid-template-columns: repeat(6, 1fr); gap: 4px; padding: 0 6px; bottom: 7px; } .action-button { min-height: 53px; } .action-button small { font-size: 7px; } .combo-badge { left: 4%; top: 38%; } }
