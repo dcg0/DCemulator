@@ -13,7 +13,7 @@
 
 Haz clic en la imagen o en el enlace inferior para ingresar al laboratorio web oficial:
 
-[![DC-laboratory Banner](https://dcg0.github.io/DC-laboratory/logo.original.png)](https://dcg0.github.io/DC-laboratory/)
+[![DCemulator Banner](assets/DCemulatorr.png)](https://dcg0.github.io/DC-laboratory/)
 
 👉 **[Acceder a DC-Laboratory (dcg0.github.io)](https://dcg0.github.io/DC-laboratory/)**
 
