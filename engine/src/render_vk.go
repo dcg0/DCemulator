@@ -1,0 +1,10587 @@
+package main
+
+import (
+	"bytes"
+	"container/list"
+	"embed" // Support for go:embed resources
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"unsafe"
+
+	vk "github.com/Eiton/vulkan"
+	mgl "github.com/go-gl/mathgl/mgl32"
+	"github.com/veandco/go-sdl2/sdl"
+)
+
+var vkDebug bool
+
+//go:embed shaders/sprite.vert.spv
+//go:embed shaders/sprite.frag.spv
+//go:embed shaders/font.vert.spv
+//go:embed shaders/font.frag.spv
+//go:embed shaders/ident.vert.spv
+//go:embed shaders/ident.frag.spv
+//go:embed shaders/model.vert.spv
+//go:embed shaders/model.frag.spv
+//go:embed shaders/shadow.vert.spv
+//go:embed shaders/shadow.frag.spv
+//go:embed shaders/panoramaToCubeMap.frag.spv
+//go:embed shaders/cubemapFiltering.frag.spv
+var staticFiles embed.FS
+
+// ------------------------------------------------------------------
+// Texture_VK
+
+type Texture_VK struct {
+	width               int32
+	height              int32
+	depth               int32
+	filter              bool
+	mipLevels           uint32
+	offset              [2]int32
+	uvst                [4]float32
+	img                 vk.Image
+	imageView           vk.ImageView
+	sampler             vk.Sampler
+	allocation          *VulkanAllocation
+	residency           TextureResidency // memory residency state for VRAM eviction
+	lastUsedFrame       uint64           // frame counter for LRU eviction decisions
+	hostBackingBuffer   []byte           // holds pixel data when texture is swapped out to host RAM
+	hostVisibleUploaded bool             // tracks whether HOST_VISIBLE texture has been uploaded (for barrier layout choice)
+	nonSwappable        bool             // true for textures that must stay in DEVICE_LOCAL (font atlas, render targets, etc.)
+	needsReload         bool             // set when evicted; TouchTexture recreates from hostBackingBuffer
+}
+
+// MarkNonSwappable marks a texture as ineligible for VRAM swap-out.
+// Font atlas textures, render targets, and other critical textures must stay in DEVICE_LOCAL.
+// SwapOutTextures also checks this flag as defense-in-depth.
+func (t *Texture_VK) MarkNonSwappable() {
+	t.nonSwappable = true
+	if r, ok := gfx.(*Renderer_VK); ok {
+		delete(r.swappableTextures, t)
+	}
+}
+
+// SampledLayout returns the correct image layout for shader sampling.
+// HOST_VISIBLE textures with LINEAR tiling must use GENERAL layout;
+// DEVICE_LOCAL textures with OPTIMAL tiling use SHADER_READ_ONLY_OPTIMAL.
+func (t *Texture_VK) SampledLayout() vk.ImageLayout {
+	if t.residency == ResidentHostVisible {
+		return vk.ImageLayoutGeneral
+	}
+	return vk.ImageLayoutShaderReadOnlyOptimal
+}
+
+func (r *Renderer_VK) newTexture(width, height, depth int32, filter bool) (Texture, error) {
+	t := &Texture_VK{width, height, depth, filter, 1, [2]int32{0, 0}, [4]float32{0, 0, 1, 1}, nil, nil, nil, nil, ResidentDeviceLocal, 0, nil, false, false, false}
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, 1, vk.ImageUsageFlags(vk.ImageUsageTransferSrcBit|vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), 1, vk.ImageTilingOptimal, false)
+
+	alloc, err := r.allocator.AllocateImageMemoryWithFallback(t.img, vk.MemoryPropertyDeviceLocalBit, vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit)
+	if err != nil {
+		vk.DestroyImage(r.device, t.img, nil)
+		return nil, fmt.Errorf("newTexture: %w", err)
+	}
+	t.allocation = alloc
+
+	if alloc.isHostVisible {
+		// Fallback: recreate image with LINEAR tiling for HOST_VISIBLE memory.
+		r.allocator.FreeImageAllocation(t.img, alloc)
+		vk.DestroyImage(r.device, t.img, nil)
+
+		t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, 1, vk.ImageUsageFlags(vk.ImageUsageTransferSrcBit|vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), 1, vk.ImageTilingLinear, false)
+
+		alloc2, err2 := r.allocator.AllocateImageMemory(t.img, vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit)
+		if err2 != nil {
+			vk.DestroyImage(r.device, t.img, nil)
+			return nil, fmt.Errorf("newTexture: HOST_VISIBLE fallback allocation failed: %w", err2)
+		}
+		t.allocation = alloc2
+		t.residency = ResidentHostVisible
+	}
+
+	t.imageView = r.CreateImageView(t.img, format, 0, 1, 1, false)
+
+	runtime.SetFinalizer(t, func(t *Texture_VK) {
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypeTexture,
+			[]interface{}{t.img, t.imageView, t.sampler, t.allocation},
+		}
+	})
+	if !t.nonSwappable {
+		r.swappableTextures[t] = true
+	}
+	return t, nil
+}
+
+func (r *Renderer_VK) newModelTexture(width, height, depth int32, filter bool) (Texture, error) {
+	t := &Texture_VK{width, height, depth, filter, 1, [2]int32{0, 0}, [4]float32{0, 0, 1, 1}, nil, nil, nil, nil, ResidentDeviceLocal, 0, nil, false, false, false}
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	t.mipLevels = uint32(math.Floor(math.Log2(float64(Max(int(width), int(height))))) + 1)
+	t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, 1, vk.ImageUsageFlags(vk.ImageUsageTransferSrcBit|vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), 1, vk.ImageTilingOptimal, false)
+
+	alloc, err := r.allocator.AllocateImageMemoryWithFallback(t.img, vk.MemoryPropertyDeviceLocalBit, vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit)
+	if err != nil {
+		vk.DestroyImage(r.device, t.img, nil)
+		return nil, fmt.Errorf("newModelTexture: %w", err)
+	}
+	t.allocation = alloc
+
+	if alloc.isHostVisible {
+		r.allocator.FreeImageAllocation(t.img, alloc)
+		vk.DestroyImage(r.device, t.img, nil)
+
+		t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, 1, vk.ImageUsageFlags(vk.ImageUsageTransferSrcBit|vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), 1, vk.ImageTilingLinear, false)
+
+		alloc2, err2 := r.allocator.AllocateImageMemory(t.img, vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit)
+		if err2 != nil {
+			vk.DestroyImage(r.device, t.img, nil)
+			return nil, fmt.Errorf("newModelTexture: HOST_VISIBLE fallback allocation failed: %w", err2)
+		}
+		t.allocation = alloc2
+		t.residency = ResidentHostVisible
+	}
+
+	t.imageView = r.CreateImageView(t.img, format, 0, t.mipLevels, 1, false)
+
+	runtime.SetFinalizer(t, func(t *Texture_VK) {
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypeTexture,
+			[]interface{}{t.img, t.imageView, t.sampler, t.allocation},
+		}
+	})
+	// Model textures are never swapped out of DEVICE_LOCAL — they must stay resident.
+	return t, nil
+}
+
+func (r *Renderer_VK) newDataTexture(width, height int32) (Texture, error) {
+	t := &Texture_VK{width, height, 32 * 4, false, 1, [2]int32{0, 0}, [4]float32{0, 0, 1, 1}, nil, nil, nil, nil, ResidentDeviceLocal, 0, nil, false, false, false}
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, 1, vk.ImageUsageFlags(vk.ImageUsageColorAttachmentBit|vk.ImageUsageSampledBit|vk.ImageUsageTransferDstBit), 1, vk.ImageTilingOptimal, false)
+
+	alloc, err := r.allocator.AllocateImageMemoryWithFallback(t.img, vk.MemoryPropertyDeviceLocalBit, vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit)
+	if err != nil {
+		vk.DestroyImage(r.device, t.img, nil)
+		return nil, fmt.Errorf("newDataTexture: %w", err)
+	}
+	t.allocation = alloc
+
+	if alloc.isHostVisible {
+		r.allocator.FreeImageAllocation(t.img, alloc)
+		vk.DestroyImage(r.device, t.img, nil)
+
+		t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, 1, vk.ImageUsageFlags(vk.ImageUsageColorAttachmentBit|vk.ImageUsageSampledBit|vk.ImageUsageTransferDstBit), 1, vk.ImageTilingLinear, false)
+
+		alloc2, err2 := r.allocator.AllocateImageMemory(t.img, vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit)
+		if err2 != nil {
+			vk.DestroyImage(r.device, t.img, nil)
+			return nil, fmt.Errorf("newDataTexture: HOST_VISIBLE fallback allocation failed: %w", err2)
+		}
+		t.allocation = alloc2
+		t.residency = ResidentHostVisible
+	}
+
+	t.imageView = r.CreateImageView(t.img, format, 0, 1, 1, false)
+	t.sampler = r.GetSampler(VulkanSamplerInfo{TextureSamplingFilterNearest, TextureSamplingFilterNearest, TextureSamplingWrapClampToEdge, TextureSamplingWrapClampToEdge})
+
+	runtime.SetFinalizer(t, func(t *Texture_VK) {
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypeTexture,
+			[]interface{}{t.img, t.imageView, t.sampler, t.allocation},
+		}
+	})
+	// Data textures are never swapped out of DEVICE_LOCAL — they must stay resident.
+	return t, nil
+}
+
+func (r *Renderer_VK) newHDRTexture(width, height int32) (Texture, error) {
+	t, err := r.newTexture(width, height, 32*4, true) //float
+	if err != nil {
+		return nil, err
+	}
+	t.(*Texture_VK).sampler = r.GetSampler(VulkanSamplerInfo{TextureSamplingFilterLinear, TextureSamplingFilterLinear, TextureSamplingWrapMirroredRepeat, TextureSamplingWrapMirroredRepeat})
+	t.MarkNonSwappable() // HDR textures are render targets — must stay resident.
+	return t, nil
+}
+func (r *Renderer_VK) newCubeMapTexture(widthHeight int32, mipmap bool, lowestMipLevel int32) (Texture, error) {
+	t := &Texture_VK{widthHeight, widthHeight, 128, false, 1, [2]int32{0, 0}, [4]float32{0, 0, 1, 1}, nil, nil, nil, nil, ResidentDeviceLocal, 0, nil, false, false, false}
+	if mipmap {
+		t.mipLevels = uint32(math.Floor(math.Log2(float64(widthHeight)))+1) - uint32(lowestMipLevel)
+		t.sampler = r.GetSampler(VulkanSamplerInfo{TextureSamplingFilterLinear, TextureSamplingFilterLinearMipMapLinear, TextureSamplingWrapClampToEdge, TextureSamplingWrapClampToEdge})
+	} else {
+		t.sampler = r.GetSampler(VulkanSamplerInfo{TextureSamplingFilterLinear, TextureSamplingFilterLinear, TextureSamplingWrapClampToEdge, TextureSamplingWrapClampToEdge})
+	}
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, 6, vk.ImageUsageFlags(vk.ImageUsageColorAttachmentBit|vk.ImageUsageTransferSrcBit|vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), 1, vk.ImageTilingOptimal, true)
+
+	alloc, err := r.allocator.AllocateImageMemoryWithFallback(t.img, vk.MemoryPropertyDeviceLocalBit, vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit)
+	if err != nil {
+		vk.DestroyImage(r.device, t.img, nil)
+		return nil, fmt.Errorf("newCubeMapTexture: %w", err)
+	}
+	t.allocation = alloc
+
+	if alloc.isHostVisible {
+		r.allocator.FreeImageAllocation(t.img, alloc)
+		vk.DestroyImage(r.device, t.img, nil)
+
+		t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, 6, vk.ImageUsageFlags(vk.ImageUsageColorAttachmentBit|vk.ImageUsageTransferSrcBit|vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), 1, vk.ImageTilingLinear, true)
+
+		alloc2, err2 := r.allocator.AllocateImageMemory(t.img, vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit)
+		if err2 != nil {
+			vk.DestroyImage(r.device, t.img, nil)
+			return nil, fmt.Errorf("newCubeMapTexture: HOST_VISIBLE fallback allocation failed: %w", err2)
+		}
+		t.allocation = alloc2
+		t.residency = ResidentHostVisible
+	}
+
+	t.imageView = r.CreateImageView(t.img, format, 0, t.mipLevels, 6, true)
+
+	runtime.SetFinalizer(t, func(t *Texture_VK) {
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypeTexture,
+			[]interface{}{t.img, t.imageView, t.sampler, t.allocation},
+		}
+	})
+	// Cubemap textures are never swapped out of DEVICE_LOCAL — they must stay resident.
+	return t, nil
+}
+
+func (r *Renderer_VK) newPaletteTexture() Texture {
+	t := &Texture_VK{256, 1, 32, false, 1, [2]int32{0, 0}, [4]float32{0, 0, 1, 1}, nil, nil, nil, nil, ResidentDeviceLocal, 0, nil, false, false, false}
+	if r.palTexture.emptySlot.Len() == 0 {
+		r.addPalTexture()
+	}
+	slot := r.palTexture.emptySlot.Remove(r.palTexture.emptySlot.Front()).([2]uint32)
+	t.offset = [2]int32{int32((slot[1] / r.palTexture.size) * 256), int32(slot[1] % r.palTexture.size)}
+	t.img = r.palTexture.textures[slot[0]].img
+	t.imageView = r.palTexture.textures[slot[0]].imageView
+	t.uvst = [4]float32{
+		(float32(t.offset[0]) + 0.5) / float32(r.palTexture.size),
+		(float32(t.offset[1]) + 0.5) / float32(r.palTexture.size),
+		float32(256) / float32(r.palTexture.size),
+		float32(1) / float32(r.palTexture.size),
+	}
+
+	runtime.SetFinalizer(t, func(t *Texture_VK) {
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypePaletteTexture,
+			[]interface{}{
+				slot,
+			},
+		}
+	})
+	return t
+}
+
+func (r *Renderer_VK) newDummyCubeMapTexture() (*Texture_VK, error) {
+	t := &Texture_VK{1, 1, 8, false, 1, [2]int32{0, 0}, [4]float32{0, 0, 1, 1}, nil, nil, nil, nil, ResidentDeviceLocal, 0, nil, false, false, false}
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, 6, vk.ImageUsageFlags(vk.ImageUsageTransferSrcBit|vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), 1, vk.ImageTilingOptimal, true)
+
+	alloc, err := r.allocator.AllocateImageMemoryWithFallback(t.img, vk.MemoryPropertyDeviceLocalBit, vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit)
+	if err != nil {
+		vk.DestroyImage(r.device, t.img, nil)
+		return nil, fmt.Errorf("newDummyCubeMapTexture: %w", err)
+	}
+	t.allocation = alloc
+
+	if alloc.isHostVisible {
+		r.allocator.FreeImageAllocation(t.img, alloc)
+		vk.DestroyImage(r.device, t.img, nil)
+
+		t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, 6, vk.ImageUsageFlags(vk.ImageUsageTransferSrcBit|vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), 1, vk.ImageTilingLinear, true)
+
+		alloc2, err2 := r.allocator.AllocateImageMemory(t.img, vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit)
+		if err2 != nil {
+			vk.DestroyImage(r.device, t.img, nil)
+			return nil, fmt.Errorf("newDummyCubeMapTexture: HOST_VISIBLE fallback allocation failed: %w", err2)
+		}
+		t.allocation = alloc2
+		t.residency = ResidentHostVisible
+	}
+
+	t.imageView = r.CreateImageView(t.img, format, 0, t.mipLevels, 6, true)
+
+	runtime.SetFinalizer(t, func(t *Texture_VK) {
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypeTexture,
+			[]interface{}{t.img, t.imageView, t.sampler, t.allocation},
+		}
+	})
+	// Dummy cubemap textures are never swapped out of DEVICE_LOCAL — they must stay resident.
+	return t, nil
+}
+
+// uploadHostVisibleData maps the texture's HOST_VISIBLE allocation, copies data
+// directly into mapped memory, and issues a pipeline barrier to transition the
+// image layout to SHADER_READ_ONLY_OPTIMAL. For first uploads, the transition
+// starts from PREINITIALIZED (correct for LINEAR tiling). For subsequent updates,
+// the transition starts from GENERAL.
+func (r *Renderer_VK) uploadHostVisibleData(t *Texture_VK, data []byte, x, y, width, height int32, baseArrayLayer uint32) {
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	bytesPerPixel := vkFormatBytesPerPixel(format)
+
+	// Get subresource layout for row pitch (LINEAR tiling images)
+	var subresourceLayout vk.SubresourceLayout
+	vk.GetImageSubresourceLayout(r.device, t.img, &vk.ImageSubresource{
+		AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit),
+		MipLevel:   0,
+		ArrayLayer: baseArrayLayer,
+	}, &subresourceLayout)
+
+	rowPitch := subresourceLayout.RowPitch
+
+	// Map host-visible memory
+	var mappedData unsafe.Pointer
+	if err := vk.Error(vk.MapMemory(r.device, t.allocation.deviceMemory, t.allocation.offset, vk.DeviceSize(vk.WholeSize), 0, &mappedData)); err != nil {
+		LogMessage("[ERROR] uploadHostVisibleData: vk.MapMemory failed: %v", err)
+		return
+	}
+	defer vk.UnmapMemory(r.device, t.allocation.deviceMemory)
+
+	// Copy data row by row using the actual row pitch
+	dstBase := uintptr(mappedData)
+	srcRowBytes := int(uint32(width) * bytesPerPixel)
+	for row := int32(0); row < height; row++ {
+		dstOffset := dstBase + uintptr((y+row)*int32(rowPitch)+x*int32(bytesPerPixel))
+		srcOffset := int(row) * srcRowBytes
+		vk.Memcopy(unsafe.Pointer(dstOffset), data[srcOffset:srcOffset+srcRowBytes])
+	}
+
+	// Flush if not HOST_COHERENT (safety measure; in practice HOST_VISIBLE+HOST_COHERENT is expected)
+	if t.allocation.isHostVisible && (t.allocation.memProperties&vk.MemoryPropertyHostCoherentBit) == 0 {
+		mappedRange := vk.MappedMemoryRange{
+			SType:  vk.StructureTypeMappedMemoryRange,
+			Memory: t.allocation.deviceMemory,
+			Offset: t.allocation.offset,
+			Size:   vk.DeviceSize(vk.WholeSize),
+		}
+		vk.FlushMappedMemoryRanges(r.device, 1, []vk.MappedMemoryRange{mappedRange})
+	}
+
+	// Issue pipeline barrier for layout transition
+	r.poolMutex.Lock()
+	commandBuffer := r.BeginSingleTimeCommands()
+	r.poolMutex.Unlock()
+	oldLayout := vk.ImageLayoutPreinitialized
+	if t.hostVisibleUploaded {
+		oldLayout = vk.ImageLayoutGeneral
+	}
+	barrier := vk.ImageMemoryBarrier{
+		SType:               vk.StructureTypeImageMemoryBarrier,
+		OldLayout:           oldLayout,
+		NewLayout:           vk.ImageLayoutGeneral, // LINEAR tiling requires GENERAL for shader sampling
+		SrcAccessMask:       vk.AccessFlags(vk.AccessHostWriteBit),
+		DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+		SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+		DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+		Image:               t.img,
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   0,
+			LevelCount:     1,
+			BaseArrayLayer: baseArrayLayer,
+			LayerCount:     1,
+		},
+	}
+	vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageHostBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, 1, []vk.ImageMemoryBarrier{barrier})
+	r.poolMutex.Lock()
+	r.EndSingleTimeCommands(commandBuffer)
+	r.poolMutex.Unlock()
+	t.hostVisibleUploaded = true
+}
+
+func (t *Texture_VK) SetData(textureData []byte) {
+	if textureData == nil {
+		return
+	}
+	t.SetSubData(textureData, t.offset[0], t.offset[1], t.width, t.height, 0)
+}
+
+func (t *Texture_VK) SetSubData(textureData []byte, x, y, width, height, stride int32) {
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	bytesPerPixel := vkFormatBytesPerPixel(format)
+
+	if t.depth == 24 && bytesPerPixel == 4 {
+		textureData = gfx.(*Renderer_VK).rgbtoRGBABytes(textureData)
+	}
+
+	rowLength := uint32(width)
+	if stride > 0 {
+		rowLength = uint32(stride) / bytesPerPixel
+	}
+
+	size := rowLength * uint32(height) * bytesPerPixel
+
+	// Direct-write path for HOST_VISIBLE textures
+	if t.residency == ResidentHostVisible {
+		gfx.(*Renderer_VK).uploadHostVisibleData(t, textureData, x, y, width, height, 0)
+		return
+	}
+
+	bufferOffset := gfx.(*Renderer_VK).CopyToStagingBuffer(size, textureData)
+	imageExtent := vk.Extent3D{
+		Width:  uint32(width),
+		Height: uint32(height),
+		Depth:  1,
+	}
+	imageOffset := vk.Offset3D{
+		X: x,
+		Y: y,
+		Z: 0,
+	}
+	regions, ok := gfx.(*Renderer_VK).stagingImageCopyRegions[t.img]
+	if !ok {
+		regions = make([]vk.BufferImageCopy, 0, 1)
+		gfx.(*Renderer_VK).stagingImageBarriers[0] = append(gfx.(*Renderer_VK).stagingImageBarriers[0], vk.ImageMemoryBarrier{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutTransferDstOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     t.mipLevels,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		})
+		gfx.(*Renderer_VK).stagingImageBarriers[1] = append(gfx.(*Renderer_VK).stagingImageBarriers[1], vk.ImageMemoryBarrier{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutTransferDstOptimal,
+			NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+			DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     t.mipLevels,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		})
+	}
+	gfx.(*Renderer_VK).stagingImageCopyRegions[t.img] = append(regions, vk.BufferImageCopy{
+		BufferOffset:      bufferOffset,
+		BufferRowLength:   rowLength,
+		BufferImageHeight: 0,
+		ImageSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+		ImageOffset: imageOffset,
+		ImageExtent: imageExtent,
+	})
+}
+
+func (t *Texture_VK) SetDataG(textureData []byte, mag, min, ws, wt TextureSamplingParam) {
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	bytesPerPixel := vkFormatBytesPerPixel(format)
+	if t.depth == 24 && bytesPerPixel == 4 {
+		textureData = gfx.(*Renderer_VK).rgbtoRGBABytes(textureData)
+	}
+	size := uint32(t.width*t.height) * bytesPerPixel
+	t.sampler = gfx.(*Renderer_VK).GetSampler(VulkanSamplerInfo{mag, min, ws, wt})
+
+	// Direct-write path for HOST_VISIBLE textures
+	if t.residency == ResidentHostVisible {
+		gfx.(*Renderer_VK).uploadHostVisibleData(t, textureData, 0, 0, t.width, t.height, 0)
+
+		if t.mipLevels > 1 {
+			// Generate mipmaps via blit from the base level
+			commandBuffer := gfx.(*Renderer_VK).BeginSingleTimeCommands()
+			// Transition base level from GENERAL to TRANSFER_SRC_OPTIMAL (HOST_VISIBLE LINEAR textures use GENERAL)
+			barriers := []vk.ImageMemoryBarrier{
+				{
+					SType:               vk.StructureTypeImageMemoryBarrier,
+					OldLayout:           vk.ImageLayoutGeneral,
+					NewLayout:           vk.ImageLayoutTransferSrcOptimal,
+					SrcAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+					DstAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+					SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+					DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+					Image:               t.img,
+					SubresourceRange: vk.ImageSubresourceRange{
+						AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+						BaseMipLevel:   0,
+						LevelCount:     1,
+						BaseArrayLayer: 0,
+						LayerCount:     1,
+					},
+				},
+				{
+					SType:               vk.StructureTypeImageMemoryBarrier,
+					OldLayout:           vk.ImageLayoutPreinitialized,
+					NewLayout:           vk.ImageLayoutTransferDstOptimal,
+					SrcAccessMask:       0,
+					DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+					SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+					DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+					Image:               t.img,
+					SubresourceRange: vk.ImageSubresourceRange{
+						AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+						BaseMipLevel:   1,
+						LevelCount:     t.mipLevels - 1,
+						BaseArrayLayer: 0,
+						LayerCount:     1,
+					},
+				},
+			}
+
+			vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+
+			for i := uint32(1); i < t.mipLevels; i++ {
+				imageBlits := []vk.ImageBlit{{
+					SrcSubresource: vk.ImageSubresourceLayers{
+						AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+						MipLevel:       i - 1,
+						BaseArrayLayer: 0,
+						LayerCount:     1,
+					},
+					SrcOffsets: [2]vk.Offset3D{
+						{
+							X: 0,
+							Y: 0,
+							Z: 0,
+						},
+						{
+							X: (t.width >> (i - 1)),
+							Y: (t.height >> (i - 1)),
+							Z: 1,
+						},
+					},
+					DstSubresource: vk.ImageSubresourceLayers{
+						AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+						MipLevel:       i,
+						BaseArrayLayer: 0,
+						LayerCount:     1,
+					},
+					DstOffsets: [2]vk.Offset3D{
+						{
+							X: 0,
+							Y: 0,
+							Z: 0,
+						},
+						{
+							X: (t.width >> i),
+							Y: (t.height >> i),
+							Z: 1,
+						},
+					},
+				}}
+				vk.CmdBlitImage(commandBuffer, t.img, vk.ImageLayoutTransferSrcOptimal, t.img, vk.ImageLayoutTransferDstOptimal, uint32(len(imageBlits)), imageBlits, vk.FilterLinear)
+				barriers = []vk.ImageMemoryBarrier{
+					{
+						SType:               vk.StructureTypeImageMemoryBarrier,
+						OldLayout:           vk.ImageLayoutTransferDstOptimal,
+						NewLayout:           vk.ImageLayoutTransferSrcOptimal,
+						SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+						DstAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+						SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+						DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+						Image:               t.img,
+						SubresourceRange: vk.ImageSubresourceRange{
+							AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+							BaseMipLevel:   i,
+							LevelCount:     1,
+							BaseArrayLayer: 0,
+							LayerCount:     1,
+						},
+					},
+				}
+				vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+			}
+
+			barriers = []vk.ImageMemoryBarrier{
+				{
+					SType:               vk.StructureTypeImageMemoryBarrier,
+					OldLayout:           vk.ImageLayoutTransferSrcOptimal,
+					NewLayout:           vk.ImageLayoutGeneral, // LINEAR tiling requires GENERAL for shader sampling
+					SrcAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+					DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+					SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+					DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+					Image:               t.img,
+					SubresourceRange: vk.ImageSubresourceRange{
+						AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+						BaseMipLevel:   0,
+						LevelCount:     t.mipLevels,
+						BaseArrayLayer: 0,
+						LayerCount:     1,
+					},
+				},
+			}
+			vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+			vk.EndCommandBuffer(commandBuffer)
+			gfx.(*Renderer_VK).tempCommands = append(gfx.(*Renderer_VK).tempCommands, commandBuffer)
+		}
+		return
+	}
+
+	bufferOffset := gfx.(*Renderer_VK).CopyToStagingBuffer(size, textureData)
+	imageExtent := vk.Extent3D{
+		Width:  uint32(t.width),
+		Height: uint32(t.height),
+		Depth:  1,
+	}
+	regions, ok := gfx.(*Renderer_VK).stagingImageCopyRegions[t.img]
+	if !ok {
+		regions = make([]vk.BufferImageCopy, 0, 1)
+		gfx.(*Renderer_VK).stagingImageBarriers[0] = append(gfx.(*Renderer_VK).stagingImageBarriers[0], vk.ImageMemoryBarrier{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutTransferDstOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		})
+		if t.mipLevels <= 1 {
+			gfx.(*Renderer_VK).stagingImageBarriers[0] = append(gfx.(*Renderer_VK).stagingImageBarriers[0], vk.ImageMemoryBarrier{
+				SType:               vk.StructureTypeImageMemoryBarrier,
+				OldLayout:           vk.ImageLayoutTransferDstOptimal,
+				NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+				SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+				DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+				SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+				DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+				Image:               t.img,
+				SubresourceRange: vk.ImageSubresourceRange{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					BaseMipLevel:   0,
+					LevelCount:     1,
+					BaseArrayLayer: 0,
+					LayerCount:     1,
+				},
+			})
+		}
+	}
+	gfx.(*Renderer_VK).stagingImageCopyRegions[t.img] = append(regions, vk.BufferImageCopy{
+		BufferOffset:      bufferOffset,
+		BufferRowLength:   0,
+		BufferImageHeight: 0,
+		ImageSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+		ImageOffset: vk.Offset3D{
+			X: 0,
+			Y: 0,
+			Z: 0,
+		},
+		ImageExtent: imageExtent,
+	})
+	if t.mipLevels > 1 {
+		commandBuffer := gfx.(*Renderer_VK).BeginSingleTimeCommands()
+		barriers := []vk.ImageMemoryBarrier{
+			{
+				SType:               vk.StructureTypeImageMemoryBarrier,
+				OldLayout:           vk.ImageLayoutTransferDstOptimal,
+				NewLayout:           vk.ImageLayoutTransferSrcOptimal,
+				SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+				DstAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+				SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+				DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+				Image:               t.img,
+				SubresourceRange: vk.ImageSubresourceRange{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					BaseMipLevel:   0,
+					LevelCount:     1,
+					BaseArrayLayer: 0,
+					LayerCount:     1,
+				},
+			},
+			{
+				SType:               vk.StructureTypeImageMemoryBarrier,
+				OldLayout:           vk.ImageLayoutUndefined,
+				NewLayout:           vk.ImageLayoutTransferDstOptimal,
+				SrcAccessMask:       0,
+				DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+				SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+				DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+				Image:               t.img,
+				SubresourceRange: vk.ImageSubresourceRange{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					BaseMipLevel:   1,
+					LevelCount:     t.mipLevels - 1,
+					BaseArrayLayer: 0,
+					LayerCount:     1,
+				},
+			},
+		}
+
+		vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+
+		for i := uint32(1); i < t.mipLevels; i++ {
+			imageBlits := []vk.ImageBlit{{
+				SrcSubresource: vk.ImageSubresourceLayers{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					MipLevel:       i - 1,
+					BaseArrayLayer: 0,
+					LayerCount:     1,
+				},
+				SrcOffsets: [2]vk.Offset3D{
+					{
+						X: 0,
+						Y: 0,
+						Z: 0,
+					},
+					{
+						X: (t.width >> (i - 1)),
+						Y: (t.height >> (i - 1)),
+						Z: 1,
+					},
+				},
+				DstSubresource: vk.ImageSubresourceLayers{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					MipLevel:       i,
+					BaseArrayLayer: 0,
+					LayerCount:     1,
+				},
+				DstOffsets: [2]vk.Offset3D{
+					{
+						X: 0,
+						Y: 0,
+						Z: 0,
+					},
+					{
+						X: (t.width >> i),
+						Y: (t.height >> i),
+						Z: 1,
+					},
+				},
+			}}
+			vk.CmdBlitImage(commandBuffer, t.img, vk.ImageLayoutTransferSrcOptimal, t.img, vk.ImageLayoutTransferDstOptimal, uint32(len(imageBlits)), imageBlits, vk.FilterLinear)
+			barriers = []vk.ImageMemoryBarrier{
+				{
+					SType:               vk.StructureTypeImageMemoryBarrier,
+					OldLayout:           vk.ImageLayoutTransferDstOptimal,
+					NewLayout:           vk.ImageLayoutTransferSrcOptimal,
+					SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+					DstAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+					SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+					DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+					Image:               t.img,
+					SubresourceRange: vk.ImageSubresourceRange{
+						AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+						BaseMipLevel:   i,
+						LevelCount:     1,
+						BaseArrayLayer: 0,
+						LayerCount:     1,
+					},
+				},
+			}
+			vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+		}
+
+		barriers = []vk.ImageMemoryBarrier{
+			{
+				SType:               vk.StructureTypeImageMemoryBarrier,
+				OldLayout:           vk.ImageLayoutTransferSrcOptimal,
+				NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+				SrcAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+				DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+				SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+				DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+				Image:               t.img,
+				SubresourceRange: vk.ImageSubresourceRange{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					BaseMipLevel:   0,
+					LevelCount:     t.mipLevels,
+					BaseArrayLayer: 0,
+					LayerCount:     1,
+				},
+			},
+		}
+		vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+		vk.EndCommandBuffer(commandBuffer)
+		gfx.(*Renderer_VK).tempCommands = append(gfx.(*Renderer_VK).tempCommands, commandBuffer)
+	}
+}
+
+// modified from golang float16 package by x448 (MIT License)
+// so we don't need a whole dependency just for Android/iOS texture support
+func f32ToF16bits(f32 float32) uint16 {
+	u32 := math.Float32bits(f32)
+	// Translated from Rust to Go by Montgomery Edwards⁴⁴⁸ (github.com/x448).
+	// All 4294967296 conversions with this were confirmed to be correct by x448.
+	// Original Rust implementation is by Kathryn Long (github.com/starkat99) with MIT license.
+
+	sign := u32 & 0x80000000
+	exp := u32 & 0x7f800000
+	coef := u32 & 0x007fffff
+
+	if exp == 0x7f800000 {
+		// NaN or Infinity
+		nanBit := uint32(0)
+		if coef != 0 {
+			nanBit = uint32(0x0200)
+		}
+		return uint16((sign >> 16) | uint32(0x7c00) | nanBit | (coef >> 13))
+	}
+
+	halfSign := sign >> 16
+
+	unbiasedExp := int32(exp>>23) - 127
+	halfExp := unbiasedExp + 15
+
+	if halfExp >= 0x1f {
+		return uint16(halfSign | uint32(0x7c00))
+	}
+
+	if halfExp <= 0 {
+		if 14-halfExp > 24 {
+			return uint16(halfSign)
+		}
+		c := coef | uint32(0x00800000)
+		halfCoef := c >> uint32(14-halfExp)
+		roundBit := uint32(1) << uint32(13-halfExp)
+		if (c&roundBit) != 0 && (c&(3*roundBit-1)) != 0 {
+			halfCoef++
+		}
+		return uint16(halfSign | halfCoef)
+	}
+
+	uHalfExp := uint32(halfExp) << 10
+	halfCoef := coef >> 13
+	roundBit := uint32(0x00001000)
+	if (coef&roundBit) != 0 && (coef&(3*roundBit-1)) != 0 {
+		return uint16((halfSign | uHalfExp | halfCoef) + 1)
+	}
+	return uint16(halfSign | uHalfExp | halfCoef)
+}
+
+func (t *Texture_VK) SetPixelData(textureData []float32) {
+	if t.depth == 96 {
+		textureData = gfx.(*Renderer_VK).rgbToRGBA(textureData)
+	}
+
+	var src []byte
+	// If the format is half float (mobile), we need to convert the data
+	if t.MapInternalFormat(Max(t.depth, 8)) == vk.FormatR16g16b16a16Sfloat {
+		halves := make([]uint16, len(textureData))
+		for i, f := range textureData {
+			halves[i] = f32ToF16bits(f)
+		}
+		if len(halves) > 0 {
+			src = unsafe.Slice((*byte)(unsafe.Pointer(&halves[0])), len(halves)*2)
+		}
+	} else if len(textureData) > 0 {
+		src = unsafe.Slice((*byte)(unsafe.Pointer(&textureData[0])), len(textureData)*4)
+	}
+	size := uint32(len(src))
+
+	const m = 0x7fffffff
+
+	// Direct-write path for HOST_VISIBLE textures
+	if t.residency == ResidentHostVisible {
+		gfx.(*Renderer_VK).uploadHostVisibleData(t, src, 0, 0, t.width, t.height, 0)
+		return
+	}
+
+	bufferOffset := gfx.(*Renderer_VK).CopyToStagingBuffer(size, src)
+
+	imageExtent := vk.Extent3D{
+		Width:  uint32(t.width),
+		Height: uint32(t.height),
+		Depth:  1,
+	}
+	regions, ok := gfx.(*Renderer_VK).stagingImageCopyRegions[t.img]
+	if !ok {
+		regions = make([]vk.BufferImageCopy, 0, 1)
+		gfx.(*Renderer_VK).stagingImageBarriers[0] = append(gfx.(*Renderer_VK).stagingImageBarriers[0], vk.ImageMemoryBarrier{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutTransferDstOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     t.mipLevels,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		})
+		gfx.(*Renderer_VK).stagingImageBarriers[1] = append(gfx.(*Renderer_VK).stagingImageBarriers[1], vk.ImageMemoryBarrier{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutTransferDstOptimal,
+			NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+			DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     t.mipLevels,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		})
+	}
+	gfx.(*Renderer_VK).stagingImageCopyRegions[t.img] = append(regions, vk.BufferImageCopy{
+		BufferOffset:      bufferOffset,
+		BufferRowLength:   0,
+		BufferImageHeight: 0,
+		ImageSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+		ImageOffset: vk.Offset3D{
+			X: 0,
+			Y: 0,
+			Z: 0,
+		},
+		ImageExtent: imageExtent,
+	})
+}
+
+func (t *Texture_VK) SetCubeMapData(textureData []byte) {
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	bytesPerPixel := vkFormatBytesPerPixel(format)
+	size := uint32(t.width*t.height) * bytesPerPixel
+
+	// Direct-write path for HOST_VISIBLE textures
+	if t.residency == ResidentHostVisible {
+		for i := uint32(0); i < 6; i++ {
+			gfx.(*Renderer_VK).uploadHostVisibleData(t, textureData, 0, 0, t.width, t.height, i)
+		}
+		return
+	}
+
+	bufferOffset := gfx.(*Renderer_VK).CopyToStagingBuffer(size, textureData)
+	imageExtent := vk.Extent3D{
+		Width:  uint32(t.width),
+		Height: uint32(t.height),
+		Depth:  1,
+	}
+	regions, ok := gfx.(*Renderer_VK).stagingImageCopyRegions[t.img]
+	if !ok {
+		regions = make([]vk.BufferImageCopy, 0, 6)
+		gfx.(*Renderer_VK).stagingImageBarriers[0] = append(gfx.(*Renderer_VK).stagingImageBarriers[0], vk.ImageMemoryBarrier{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutTransferDstOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     6,
+			},
+		})
+		gfx.(*Renderer_VK).stagingImageBarriers[1] = append(gfx.(*Renderer_VK).stagingImageBarriers[1], vk.ImageMemoryBarrier{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutTransferDstOptimal,
+			NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+			DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     6,
+			},
+		})
+	}
+	for i := uint32(0); i < 6; i++ {
+		regions = append(regions, vk.BufferImageCopy{
+			BufferOffset:      bufferOffset,
+			BufferRowLength:   0,
+			BufferImageHeight: 0,
+			ImageSubresource: vk.ImageSubresourceLayers{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				MipLevel:       0,
+				BaseArrayLayer: i,
+				LayerCount:     1,
+			},
+			ImageOffset: vk.Offset3D{
+				X: 0,
+				Y: 0,
+				Z: 0,
+			},
+			ImageExtent: imageExtent,
+		})
+	}
+	gfx.(*Renderer_VK).stagingImageCopyRegions[t.img] = regions
+}
+
+func (t Texture_VK) CopyData(sourceTexture *Texture) {
+	src := (*sourceTexture).(*Texture_VK)
+
+	imageExtent := vk.Extent3D{
+		Width:  uint32(src.width),
+		Height: uint32(src.height),
+		Depth:  1,
+	}
+	imageOffset := vk.Offset3D{
+		X: 0,
+		Y: 0,
+		Z: 0,
+	}
+	commandBuffer := gfx.(*Renderer_VK).BeginSingleTimeCommands()
+	barriers := []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutTransferDstOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutTransferSrcOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               src.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, 1, barriers)
+	region := []vk.ImageCopy{{
+		SrcSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+		DstSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+		SrcOffset: imageOffset,
+		DstOffset: imageOffset,
+		Extent:    imageExtent,
+	}}
+	vk.CmdCopyImage(commandBuffer, src.img, vk.ImageLayoutTransferSrcOptimal, t.img, vk.ImageLayoutTransferDstOptimal, 1, region)
+	barriers = []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutTransferDstOptimal,
+			NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+			DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutTransferSrcOptimal,
+			NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+			DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               src.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, 1, barriers)
+	gfx.(*Renderer_VK).EndSingleTimeCommands(commandBuffer)
+}
+
+// Return whether texture has a valid handle
+func (t *Texture_VK) IsValid() bool {
+	return true
+}
+
+func (t *Texture_VK) GetWidth() int32 {
+	return t.width
+}
+
+func (t *Texture_VK) GetHeight() int32 {
+	return t.height
+}
+
+func (t *Texture_VK) MapInternalFormat(i int32) vk.Format {
+	var InternalFormatLUT = map[int32]vk.Format{
+		8:  vk.FormatR8Unorm,
+		24: vk.FormatR8g8b8Unorm,
+		32: vk.FormatR8g8b8a8Unorm,
+		// Seems like FormatR32g32b32Sfloat is not widely supported, just use FormatR32g32b32a32Sfloat
+		96:  vk.FormatR32g32b32a32Sfloat,
+		128: vk.FormatR32g32b32a32Sfloat,
+	}
+	// Fix unmapped formats on Metal (fixes crash)
+	if runtime.GOOS == "darwin" {
+		if i == 24 {
+			return vk.FormatR8g8b8a8Unorm
+		}
+	}
+	if runtime.GOOS == "android" || runtime.GOOS == "ios" {
+		if i > 32 {
+			// Android and iOS use half floats
+			return vk.FormatR16g16b16a16Sfloat
+		} else if i == 24 {
+			// Except here, we promote the format
+			return vk.FormatR8g8b8a8Unorm
+		}
+	}
+	lut := InternalFormatLUT[i]
+	if lut <= 0 {
+		lut = vk.FormatR32g32b32a32Sfloat
+	}
+	return lut
+}
+
+func vkFormatBytesPerPixel(f vk.Format) uint32 {
+	switch f {
+	case vk.FormatR8Unorm:
+		return 1
+	case vk.FormatR8g8b8Unorm:
+		return 3
+	case vk.FormatR8g8b8a8Unorm:
+		return 4
+	case vk.FormatR16g16b16a16Sfloat:
+		return 8
+	case vk.FormatR32g32b32a32Sfloat:
+		return 16
+	default:
+		return 4
+	}
+}
+
+// ------------------------------------------------------------------
+// VulkanAllocation represents a single device memory allocation (dedicated or suballocated)
+type VulkanAllocation struct {
+	deviceMemory    vk.DeviceMemory
+	offset          vk.DeviceSize
+	size            vk.DeviceSize
+	memoryTypeIndex uint32
+	memoryTypeBits  uint32 // includes both memoryTypeBits and properties for cache keying
+	memProperties   vk.MemoryPropertyFlagBits
+	blockID         uint32 // 0 = dedicated, >0 = suballocated block
+	dedicated       bool   // true if this is a dedicated allocation
+	isDeviceLocal   bool   // true if allocation is in GPU device-local memory
+	isHostVisible   bool   // true if allocation is mappable from host (CPU accessible)
+}
+
+// VulkanMemoryBlock represents a pool of device memory for suballocation.
+type VulkanMemoryBlock struct {
+	id              uint32
+	deviceMemory    vk.DeviceMemory
+	size            vk.DeviceSize
+	used            vk.DeviceSize
+	freeList        *VulkanFreeRegion
+	memoryTypeBits  uint32
+	memProperties   vk.MemoryPropertyFlagBits
+	memoryTypeIndex uint32
+}
+
+// VulkanFreeRegion is a node in a sorted free-list of available memory within a block.
+type VulkanFreeRegion struct {
+	offset vk.DeviceSize
+	size   vk.DeviceSize
+	next   *VulkanFreeRegion
+}
+
+// findFreeRegion finds a free region that fits requiredSize at the given alignment.
+// Returns (alignedOffset, true) if found, or (0, false) otherwise.
+func (block *VulkanMemoryBlock) findFreeRegion(requiredSize vk.DeviceSize, alignment vk.DeviceSize) (offset vk.DeviceSize, found bool) {
+	if alignment == 0 {
+		alignment = 1
+	}
+	alignmentMask := alignment - 1
+	for region := block.freeList; region != nil; region = region.next {
+		alignedOffset := (region.offset + alignmentMask) & ^alignmentMask
+		if alignedOffset+requiredSize <= region.offset+region.size {
+			return alignedOffset, true
+		}
+	}
+	return 0, false
+}
+
+// allocateFromFreeRegion removes or shrinks the free region at offset by size.
+// Handles four cases: exact fit (remove), start (shrink left), end (shrink right), middle (split).
+func (block *VulkanMemoryBlock) allocateFromFreeRegion(offset vk.DeviceSize, size vk.DeviceSize) {
+	var prev *VulkanFreeRegion
+	region := block.freeList
+	for region != nil {
+		if offset >= region.offset && offset < region.offset+region.size {
+			break
+		}
+		prev = region
+		region = region.next
+	}
+	if region == nil {
+		return
+	}
+
+	regionEnd := region.offset + region.size
+	allocEnd := offset + size
+
+	// Case 1: Exact fit.
+	if offset == region.offset && size == region.size {
+		if prev != nil {
+			prev.next = region.next
+		} else {
+			block.freeList = region.next
+		}
+		block.used += size
+		return
+	}
+
+	// Case 2: Allocation at the start — shrink from left.
+	if offset == region.offset {
+		region.offset = allocEnd
+		region.size = regionEnd - allocEnd
+		block.used += size
+		return
+	}
+
+	// Case 3: Allocation at the end — shrink from right.
+	if allocEnd == regionEnd {
+		region.size = offset - region.offset
+		block.used += size
+		return
+	}
+
+	// Case 4: Middle — split into before and after free regions.
+	afterRegion := &VulkanFreeRegion{
+		offset: allocEnd,
+		size:   regionEnd - allocEnd,
+		next:   region.next,
+	}
+	region.size = offset - region.offset
+	region.next = afterRegion
+	block.used += size
+}
+
+// freeFromRegion inserts a freed region back into the block's sorted free-list and
+// coalesces with adjacent free regions. Caller must hold the allocator mutex.
+func (block *VulkanMemoryBlock) freeFromRegion(offset vk.DeviceSize, size vk.DeviceSize) {
+	freed := &VulkanFreeRegion{
+		offset: offset,
+		size:   size,
+	}
+
+	if block.freeList == nil {
+		block.freeList = freed
+		block.used -= size
+		return
+	}
+
+	if freed.offset < block.freeList.offset {
+		freed.next = block.freeList
+		block.freeList = freed
+		// Coalesce with next if adjacent.
+		if freed.offset+freed.size == freed.next.offset {
+			freed.size += freed.next.size
+			freed.next = freed.next.next
+		}
+		block.used -= size
+		return
+	}
+
+	// Insert in middle or at tail.
+	var prev *VulkanFreeRegion
+	curr := block.freeList
+	for curr != nil && curr.offset < freed.offset {
+		prev = curr
+		curr = curr.next
+	}
+
+	// Coalesce with previous if adjacent.
+	if prev.offset+prev.size == freed.offset {
+		prev.size += freed.size
+		// Also coalesce with curr if now adjacent.
+		if curr != nil && prev.offset+prev.size == curr.offset {
+			prev.size += curr.size
+			prev.next = curr.next
+		}
+	} else {
+		prev.next = freed
+		freed.next = curr
+		// Coalesce with curr if adjacent.
+		if curr != nil && freed.offset+freed.size == curr.offset {
+			freed.size += curr.size
+			freed.next = curr.next
+		}
+	}
+
+	block.used -= size
+}
+
+// findOrCreateBlock finds an existing block with a suitable free region, or allocates a new one.
+// Caller must hold allocator.mu.
+func (allocator *VulkanAllocator) findOrCreateBlock(
+	memoryTypeBits uint32,
+	memProperties vk.MemoryPropertyFlagBits,
+	memoryTypeIndex uint32,
+	requiredSize vk.DeviceSize,
+	alignment vk.DeviceSize,
+) (*VulkanMemoryBlock, error) {
+	for _, block := range allocator.blocks {
+		if block.memProperties != memProperties || block.memoryTypeIndex != memoryTypeIndex {
+			continue
+		}
+		if _, found := block.findFreeRegion(requiredSize, alignment); found {
+			return block, nil
+		}
+	}
+
+	// No existing block fits — allocate a new one.
+	allocSize := allocator.blockSize
+	if requiredSize > allocSize {
+		allocSize = requiredSize
+	}
+
+	r := allocator.renderer
+	allocInfo := vk.MemoryAllocateInfo{
+		SType:           vk.StructureTypeMemoryAllocateInfo,
+		AllocationSize:  allocSize,
+		MemoryTypeIndex: memoryTypeIndex,
+	}
+	var deviceMemory vk.DeviceMemory
+	if err := vk.Error(vk.AllocateMemory(r.device, &allocInfo, nil, &deviceMemory)); err != nil {
+		allocator.recordOOMSnapshot("findOrCreateBlock", requiredSize, alignment, memProperties, memoryTypeIndex, memoryTypeBits, false, err)
+		return nil, fmt.Errorf("vk.AllocateMemory for block failed: %w", err)
+	}
+
+	// Initialize new block with a single free region covering the entire allocation.
+	block := &VulkanMemoryBlock{
+		id:           allocator.nextBlockID,
+		deviceMemory: deviceMemory,
+		size:         allocSize,
+		used:         0,
+		freeList: &VulkanFreeRegion{
+			offset: 0,
+			size:   allocSize,
+			next:   nil,
+		},
+		memoryTypeBits:  memoryTypeBits,
+		memProperties:   memProperties,
+		memoryTypeIndex: memoryTypeIndex,
+	}
+	allocator.nextBlockID++
+	allocator.blocks = append(allocator.blocks, block)
+
+	return block, nil
+}
+
+// VulkanOOMRecord captures details of the last allocation failure.
+type VulkanOOMRecord struct {
+	FailedAt           string // caller function name
+	RequestedSize      vk.DeviceSize
+	RequestedAlign     vk.DeviceSize
+	RequestedProperty  vk.MemoryPropertyFlagBits
+	MemoryTypeIndex    uint32
+	MemoryTypeBits     uint32
+	WasDedicated       bool          // true = dedicated allocation, false = suballocation
+	VulkanError        string        // raw vk.AllocateMemory error string
+	HeapSize           vk.DeviceSize // device-local heap size at time of failure
+	TrackedDedicatedMB float64       // dedicated image bytes tracked at time of failure
+	TrackedSuballocMB  float64       // suballocated bytes tracked at time of failure
+	BlockCount         int           // number of suballocation blocks at time of failure
+}
+
+// VulkanAllocator manages device memory allocations
+type VulkanAllocator struct {
+	renderer *Renderer_VK
+
+	totalImageAllocations     uint64
+	totalBufferAllocations    uint64
+	totalImageBytesRequested  uint64
+	totalBufferBytesRequested uint64
+
+	memoryTypeCache map[uint64]uint32 // key = hash(memoryTypeBits, properties)
+
+	mu                  sync.Mutex                     // protects blocks, allocations, and free-list mutations
+	blocks              []*VulkanMemoryBlock           // pool of device-local memory blocks
+	nextBlockID         uint32                         // 0 = dedicated, >0 = suballocated block ID
+	smallImageThreshold vk.DeviceSize                  // images ≤ this size are suballocated (bytes)
+	blockSize           vk.DeviceSize                  // size of each suballocation block (bytes)
+	allocations         map[vk.Image]*VulkanAllocation // image → allocation for cleanup
+	lastOOM             VulkanOOMRecord                // details of the most recent allocation failure
+}
+
+// ------------------------------------------------------------------
+// Renderer_VK
+
+type Renderer_VK struct {
+	firstFrame bool
+
+	destroyResourceQueues     [2]chan VulkanResource
+	destroyResourceQueueIndex uint32
+	enableModel               bool
+	enableShadow              bool
+	renderShadowMap           bool
+	waitGroup                 sync.WaitGroup
+
+	gpuDevices []vk.PhysicalDevice
+	gpuIndex   uint32
+
+	setVSync                 bool
+	instance                 vk.Instance
+	surface                  vk.Surface
+	device                   vk.Device
+	queue                    vk.Queue
+	descriptorPoolSize       uint32
+	descriptorPool           vk.DescriptorPool
+	commandPools             []vk.CommandPool
+	commandBuffers           []vk.CommandBuffer
+	fences                   []vk.Fence
+	semaphores               []vk.Semaphore
+	swapchains               []*VulkanSwapchainInfo
+	mainRenderPass           *VulkanRenderInfo
+	swapchainRenderPass      *VulkanRenderInfo
+	postProcessingRenderPass *VulkanRenderInfo
+	spriteSamplers           []vk.Sampler
+	samplers                 map[VulkanSamplerInfo]vk.Sampler
+	vertexBufferOffset       uintptr
+	vertexBuffers            []VulkanBuffer
+	stagingBuffers           [2]VulkanBuffer
+	modelVertexBuffers       []VulkanBuffer
+	modelIndexBuffers        []VulkanBuffer
+	stagingBufferFences      [2]bool
+	stagingBufferIndex       uint32
+	stagingBufferOffset      uint32
+	stagingImageBarriers     [2][]vk.ImageMemoryBarrier
+	stagingImageCopyRegions  map[vk.Image][]vk.BufferImageCopy
+	tempCommands             []vk.CommandBuffer
+	usedCommands             []vk.CommandBuffer
+
+	pipelineCache            vk.PipelineCache
+	spriteProgram            *VulkanProgramInfo
+	modelProgram             *VulkanProgramInfo
+	shadowMapProgram         *VulkanProgramInfo
+	postProcessingProgram    *VulkanProgramInfo
+	panoramaToCubeMapProgram *VulkanProgramInfo
+	cubemapFilteringProgram  *VulkanProgramInfo
+	lutProgram               *VulkanProgramInfo
+	mainRenderTarget         *VulkanRenderTargetInfo
+	renderTargets            [2]*VulkanRenderTargetInfo
+	palTexture               VulkanPalTexture
+	shadowMapTextures        *Texture_VK
+	dummyTexture             *Texture_VK
+	dummyNormalTexture       *Texture_VK
+	dummyWhiteTexture        *Texture_VK
+	dummyCubeTexture         *Texture_VK
+
+	fixedSizeTextures []*Texture_VK
+
+	maxAnisotropy                   float32
+	minUniformBufferOffsetAlignment uint32
+	maxImageArrayLayers             uint32
+	memoryTypeMap                   map[vk.MemoryPropertyFlagBits]uint32
+	allocatedImageMemory            uint64
+	deviceLocalHeapSize             vk.DeviceSize
+	deviceLocalHeapIndex            uint32 // index of the device-local heap for budget queries
+
+	// Allocator for memory management
+	allocator *VulkanAllocator
+
+	customPrograms  map[uint32]*VulkanProgramInfo
+	customShaderMap map[string]uint32
+	nextShaderID    uint32
+
+	// MoltenVK behavior
+	shouldDoPerDrawPushDrawConstants bool
+
+	// Android behavior
+	hasPushDescriptors  bool
+	surfaceLost         bool
+	frameOpen           bool
+	shadowPassActive    bool
+	shadowCmdRecorded   bool
+	droidDescriptorPool vk.DescriptorPool
+	droidBindingState   map[*VulkanProgramInfo]map[uint32]vk.WriteDescriptorSet
+	poolMutex           sync.Mutex // serializes access to droidDescriptorPool/droidBindingState/r.commandPools[0]
+	surfaceMutex        sync.Mutex // surface mutex (for Android activity resume)
+
+	grabTexture *Texture_VK
+
+	currentFrameNumber uint64               // frame counter for LRU eviction decisions
+	swappableTextures  map[*Texture_VK]bool // textures eligible for VRAM eviction (sprite textures only; model, cubemap, data, and palette textures stay DEVICE_LOCAL)
+
+	// VRAM budget-aware swap (VK_EXT_memory_budget)
+	budgetEnabled            bool                                    // whether VK_EXT_memory_budget is available
+	memoryBudget             vk.PhysicalDeviceMemoryBudgetProperties // queried each frame
+	lastSwapFrame            uint64                                  // frame number of last swap-out pass (cooldown)
+	totalImageBytesAllocated vk.DeviceSize                           // running total of DEVICE_LOCAL image allocations (heuristic fallback)
+	vramSwapThresholdPercent int                                     // default 80
+	vramSwapCooldownFrames   int                                     // default 60
+	vramFallbackEnabled      bool                                    // default true (master switch)
+
+	VKState
+}
+
+type VKState struct {
+	currentProgram                *VulkanProgramInfo
+	boundProgram                  *VulkanProgramInfo
+	currentPipeline               vk.Pipeline
+	currentShadowmMapPipeline     vk.Pipeline
+	currentSpriteTexture          VulkanSpriteTexture
+	currentModelTexture           VulkanModelTexture
+	currentShadowMapTexture       VulkanModelTexture
+	scissor                       vk.Rect2D
+	spriteVertUniformBufferOffset uint32
+	spriteFragUniformBufferOffset uint32
+	modelVertAttrOffset           uint32
+	modelVertexBufferIndex        uint32
+	modelUniformBufferOffset1     uint32
+	modelUniformBufferOffset2     uint32
+	numShadowMapLayers            uint32
+	shadowMapVertAttrOffset       uint32
+	shadowMapUniformBufferOffset1 uint32
+	shadowMapUniformBufferOffset2 uint32
+	VulkanSpriteTexture
+	VulkanModelTexture
+	VulkanShadowMapTexture
+	VulkanPipelineState
+	VulkanShadowMapPipelineState
+	VulkanSpriteProgramVertUniformBufferObject
+	VulkanSpriteProgramFragUniformBufferObject
+	VulkanModelProgramUniformBufferObject0
+	VulkanModelProgramUniformBufferObject1
+	VulkanModelProgramUniformBufferObject2
+	VulkanShadowMapProgramUniformBufferObject0
+	VulkanShadowMapProgramUniformBufferObject1
+	VulkanShadowMapProgramUniformBufferObject2
+	VulkanShadowMapProgramPushConstant
+}
+
+// TextureResidency indicates where texture data resides in the memory hierarchy.
+type TextureResidency int
+
+const (
+	ResidentDeviceLocal TextureResidency = iota // texture data is in GPU device-local memory
+	ResidentHostVisible                         // texture data has been moved to host-visible GPU memory
+	ResidentSwappedOut                          // GPU resources destroyed, data in hostBackingBuffer (swap path)
+	ResidentEvicted                             // GPU resources destroyed, data in hostBackingBuffer, needsReload set (eviction path)
+)
+
+type VulkanResourceType int
+
+const (
+	VulkanResourceTypeTexture VulkanResourceType = iota
+	VulkanResourceTypePaletteTexture
+	VulkanResourceTypeBuffer
+	VulkanResourceTypeFence
+)
+
+type VulkanResource struct {
+	resourceType VulkanResourceType
+	resources    []interface{}
+}
+
+type VulkanPalTexture struct {
+	textures  []*Texture_VK
+	size      uint32
+	emptySlot *list.List
+}
+
+type VulkanSpriteTexture struct {
+	spriteTexture *Texture_VK
+	palTexture    *Texture_VK
+	customTex1    *Texture_VK
+	customTex2    *Texture_VK
+}
+type VulkanModelTexture struct {
+	lambertianEnvSampler *Texture_VK
+	GGXEnvSampler        *Texture_VK
+	GGXLUT               *Texture_VK
+	jointMatricesTexture *Texture_VK
+	morphTargetTexture   *Texture_VK
+	tex                  *Texture_VK
+	normalMap            *Texture_VK
+	metallicRoughnessMap *Texture_VK
+	ambientOcclusionMap  *Texture_VK
+	emissionMap          *Texture_VK
+}
+type VulkanShadowMapTexture struct {
+	jointMatricesTexture *Texture_VK
+	morphTargetTexture   *Texture_VK
+	tex                  *Texture_VK
+}
+
+// Set 0
+type VulkanModelProgramUniformBufferObject0 struct {
+	viewMatrix           [16]float32
+	projectionMatrix     [16]float32
+	lightMatrices        [4][16]float32
+	lights               [4]VulkanLightUniform
+	environmentRotation  [12]float32 //[9]float32
+	cameraPosition       [3]float32
+	environmentIntensity float32
+	mipCount             int32
+}
+
+// Set 1
+type VulkanModelProgramUniformBufferObject1 struct {
+	texTransform                  [12]float32 //[9]float32
+	normalMapTransform            [12]float32 //[9]float32
+	metallicRoughnessMapTransform [12]float32 //[9]float32
+	ambientOcclusionMapTransform  [12]float32 //[9]float32
+	emissionMapTransform          [12]float32 //[9]float32
+	baseColorFactor               [4]float32
+	emission                      [3]float32
+	_padding                      uint32
+	metallicRoughness             [2]float32
+	ambientOcclusionStrength      float32
+	alphaThreshold                float32
+	unlit                         bool
+	_padding2                     [3]bool
+	enableAlpha                   bool
+}
+
+// Set 2
+type VulkanModelProgramUniformBufferObject2 struct {
+	modelMatrix                 [16]float32
+	normalMatrix                [16]float32
+	numJoints                   int32
+	numTargets                  int32
+	morphTargetTextureDimension int32
+	numVertices                 uint32
+	morphTargetWeight           [2][4]float32
+	morphTargetOffset           [4]float32
+	meshOutline                 float32
+	modelGray                   float32
+	modelHue                    float32
+	_padding                    uint32
+	modelAdd                    [3]float32
+	_padding2                   uint32
+	modelMult                   [3]float32
+	_padding3                   float32
+	neg                         uint32
+}
+type VulkanShadowMapProgramUniformBufferObject0 struct {
+	lightMatrices [24][16]float32
+	lights        [4]VulkanLightUniform
+	layers        [24]float32
+}
+type VulkanShadowMapProgramUniformBufferObject1 struct {
+	texTransform    [12]float32 //[9]float32
+	baseColorFactor [4]float32
+	alphaThreshold  float32
+	enableAlpha     bool
+}
+type VulkanShadowMapProgramUniformBufferObject2 struct {
+	numJoints                   int32
+	numTargets                  int32
+	morphTargetTextureDimension int32
+	morphTargetWeight           [2][4]float32
+	morphTargetOffset           [4]float32
+}
+
+type VulkanShadowMapProgramPushConstant struct {
+	model       [16]float32
+	numVertices int32
+	lightIndex  int32
+}
+
+type VulkanPipelineState struct {
+	VulkanModelPipelineState
+	VulkanBlendState
+}
+
+type VulkanBlendState struct {
+	op  BlendEquation
+	src BlendFunc
+	dst BlendFunc
+}
+
+type VulkanModelPipelineState struct {
+	depthTest       bool
+	depthMask       bool
+	invertFrontFace bool
+	doubleSided     bool
+	useUV           bool
+	primitiveMode   PrimitiveMode
+	VulkanModelSpecializationConstants0
+	VulkanModelSpecializationConstants1
+}
+
+type VulkanShadowMapPipelineState struct {
+	invertFrontFace bool
+	doubleSided     bool
+	useUV           bool
+	primitiveMode   PrimitiveMode
+	VulkanModelSpecializationConstants0
+	VulkanModelSpecializationConstants1
+}
+type VulkanModelSpecializationConstants0 struct {
+	useJoint0           bool
+	_padding0           [3]bool
+	useJoint1           bool
+	_padding1           [3]bool
+	useNormal           bool
+	_padding2           [3]bool
+	useTangent          bool
+	_padding3           [3]bool
+	useVertColor        bool
+	_padding4           [3]bool
+	useOutlineAttribute bool
+	_padding5           [3]bool
+}
+type VulkanModelSpecializationConstants1 struct {
+	useTexture              bool
+	_padding0               [3]bool
+	useNormalMap            bool
+	_padding1               [3]bool
+	useMetallicRoughnessMap bool
+	_padding2               [3]bool
+	useEmissionMap          bool
+	_padding3               [3]bool
+	useShadowMap            bool
+	_padding4               [3]bool
+}
+
+const VulkanVertUniformSize = int(unsafe.Sizeof(VulkanSpriteProgramVertUniformBufferObject{}))
+const VulkanFragUniformSize = int(unsafe.Sizeof(VulkanSpriteProgramFragUniformBufferObject{}))
+const VulkanModelUniform0Size = int(unsafe.Sizeof(VulkanModelProgramUniformBufferObject0{}))
+const VulkanModelUniform1Size = int(unsafe.Sizeof(VulkanModelProgramUniformBufferObject1{}))
+const VulkanModelUniform2Size = int(unsafe.Sizeof(VulkanModelProgramUniformBufferObject2{}))
+const VulkanShadowMapUniform0Size = int(unsafe.Sizeof(VulkanShadowMapProgramUniformBufferObject0{}))
+const VulkanShadowMapUniform1Size = int(unsafe.Sizeof(VulkanShadowMapProgramUniformBufferObject1{}))
+const VulkanShadowMapUniform2Size = int(unsafe.Sizeof(VulkanShadowMapProgramUniformBufferObject2{}))
+
+type VulkanBuffer struct {
+	buffer       vk.Buffer
+	bufferMemory vk.DeviceMemory
+	data         unsafe.Pointer
+	size         uintptr
+}
+
+type VulkanSwapchainInfo struct {
+	swapchain         vk.Swapchain
+	currentImageIndex uint32
+	imageCount        uint32
+	images            []vk.Image
+	imageViews        []vk.ImageView
+	framebuffers      []vk.Framebuffer
+
+	extent vk.Extent2D
+	format vk.Format
+}
+
+type VulkanProgramInfo struct {
+	pipelineLayout       vk.PipelineLayout
+	descriptorSetLayouts []vk.DescriptorSetLayout
+	pipelines            []vk.Pipeline
+	pipelineIndexMap     map[interface{}]int
+	uniformBuffers       []VulkanBuffer
+	uniformBufferOffset  uint32
+	uniformSize          uint32
+	uniformOffsetMap     map[interface{}]uint32
+	vertShader           vk.ShaderModule
+	fragShader           vk.ShaderModule
+	needsGrabPass        bool
+	droidDescriptorSet   vk.DescriptorSet // for Android behavior
+}
+
+type VulkanSamplerInfo struct {
+	magFilter TextureSamplingParam
+	minFilter TextureSamplingParam
+	wrapS     TextureSamplingParam
+	wrapT     TextureSamplingParam
+}
+
+type VulkanRenderInfo struct {
+	renderPass vk.RenderPass
+}
+
+type VulkanRenderTargetInfo struct {
+	texture       *Texture_VK
+	depthTexture  *Texture_VK
+	framebuffer   vk.Framebuffer
+	descriptorSet vk.DescriptorSet
+}
+
+type VulkanSpriteProgramVertUniformBufferObject struct {
+	modelView  [16]float32
+	projection [16]float32
+}
+type VulkanSpriteProgramFragUniformBufferObject struct {
+	x1x2x4x3                      [4]float32
+	tint                          [4]float32
+	add                           [3]float32
+	_padding                      uint32
+	mult                          [3]float32
+	alpha, gray, hue              float32
+	mask                          int32
+	isFlat, isRgba, isTrapez, neg uint32
+	iTime                         float32    // 4 bytes
+	iResolution                   [2]float32 // 8 bytes
+	aspectRatio                   float32
+	sTime                         float32 // 4 bytes
+}
+
+type VulkanLightUniform struct {
+	direction  [3]float32
+	lightRange float32
+
+	color     [3]float32
+	intensity float32
+
+	position     [3]float32
+	innerConeCos float32
+
+	outerConeCos float32
+	lightType    int32
+
+	shadowBias   float32
+	shadowMapFar float32
+}
+
+var appInfo = &vk.ApplicationInfo{
+	SType:              vk.StructureTypeApplicationInfo,
+	ApiVersion:         vk.MakeVersion(1, 3, 0),
+	ApplicationVersion: vk.MakeVersion(1, 0, 0),
+	PApplicationName:   "Ikemen GO\x00",
+	PEngineName:        "Ikemen GO\x00",
+	EngineVersion:      vk.MakeVersion(0, 99, 0),
+}
+
+var vk_validationLayers = []string{
+	"VK_LAYER_KHRONOS_validation\x00",
+}
+
+func (r *Renderer_VK) GetName() string {
+	return "Vulkan 1.3.239"
+}
+
+func (r *Renderer_VK) DebugInfo() string {
+	var sb strings.Builder
+
+	// Always include the last OOM record if one exists — this is critical crash data
+	a := r.allocator
+	if a != nil {
+		a.mu.Lock()
+		oom := a.lastOOM
+		if oom.FailedAt != "" {
+			sb.WriteString("=== Last OOM Failure ===\n")
+			sb.WriteString(fmt.Sprintf("  Failed at: %s\n", oom.FailedAt))
+			sb.WriteString(fmt.Sprintf("  Requested: %.2f MB (alignment: %d bytes)\n", float64(oom.RequestedSize)/(1024*1024), oom.RequestedAlign))
+			sb.WriteString(fmt.Sprintf("  Memory type: index=%d bits=0x%X property=%d\n", oom.MemoryTypeIndex, oom.MemoryTypeBits, int(oom.RequestedProperty)))
+			sb.WriteString(fmt.Sprintf("  Allocation type: %s\n", map[bool]string{true: "dedicated", false: "suballocated"}[oom.WasDedicated]))
+			sb.WriteString(fmt.Sprintf("  Vulkan error: %s\n", oom.VulkanError))
+			sb.WriteString(fmt.Sprintf("  Device-local heap at failure: %.0f MB\n", float64(oom.HeapSize)/(1024*1024)))
+			sb.WriteString(fmt.Sprintf("  Tracked dedicated at failure: %.2f MB\n", oom.TrackedDedicatedMB))
+			sb.WriteString(fmt.Sprintf("  Tracked suballoc at failure: %.2f MB\n", oom.TrackedSuballocMB))
+			sb.WriteString(fmt.Sprintf("  Suballoc blocks at failure: %d\n", oom.BlockCount))
+			if oom.HeapSize > 0 {
+				totalTracked := (oom.TrackedDedicatedMB + oom.TrackedSuballocMB) * 1024 * 1024
+				sb.WriteString(fmt.Sprintf("  Heap usage at failure: %.1f%%\n", float64(totalTracked)/float64(oom.HeapSize)*100))
+			}
+		}
+		a.mu.Unlock()
+	}
+
+	if !sys.cfg.Video.RendererDebugMode {
+		return sb.String()
+	}
+
+	// Full debug stats only when RendererDebugMode is enabled
+	sb.WriteString(fmt.Sprintf("Device-local heap: %.0f MB\n", float64(r.deviceLocalHeapSize)/(1024*1024)))
+
+	// Allocator stats
+	if a != nil {
+		a.mu.Lock()
+		sb.WriteString(fmt.Sprintf("Image allocations (lifetime): %d\n", a.totalImageAllocations))
+		sb.WriteString(fmt.Sprintf("Image bytes requested (lifetime): %.2f MB\n", float64(a.totalImageBytesRequested)/(1024*1024)))
+		sb.WriteString(fmt.Sprintf("Buffer allocations (lifetime): %d\n", a.totalBufferAllocations))
+		sb.WriteString(fmt.Sprintf("Buffer bytes requested (lifetime): %.2f MB\n", float64(a.totalBufferBytesRequested)/(1024*1024)))
+		sb.WriteString(fmt.Sprintf("Suballocation blocks: %d\n", len(a.blocks)))
+		sb.WriteString(fmt.Sprintf("Active image allocations: %d\n", len(a.allocations)))
+		sb.WriteString(fmt.Sprintf("Suballoc threshold: %.0f KB\n", float64(a.smallImageThreshold)/1024))
+		sb.WriteString(fmt.Sprintf("Suballoc block size: %.0f MB\n", float64(a.blockSize)/(1024*1024)))
+
+		var totalBlockUsed vk.DeviceSize
+		for _, block := range a.blocks {
+			totalBlockUsed += block.used
+			sb.WriteString(fmt.Sprintf("  Block %d: size=%.2f MB used=%.2f MB (%.1f%%)\n",
+				block.id,
+				float64(block.size)/(1024*1024),
+				float64(block.used)/(1024*1024),
+				float64(block.used)/float64(block.size)*100))
+		}
+		sb.WriteString(fmt.Sprintf("Total suballoc block memory in use: %.2f MB\n", float64(totalBlockUsed)/(1024*1024)))
+
+		// Count dedicated vs suballocated
+		var dedicatedCount, dedicatedBytes int64
+		var suballocCount, suballocBytes int64
+		for _, alloc := range a.allocations {
+			if alloc.dedicated {
+				dedicatedCount++
+				dedicatedBytes += int64(alloc.size)
+			} else {
+				suballocCount++
+				suballocBytes += int64(alloc.size)
+			}
+		}
+		sb.WriteString(fmt.Sprintf("Dedicated image allocations: %d (%.2f MB)\n", dedicatedCount, float64(dedicatedBytes)/(1024*1024)))
+		sb.WriteString(fmt.Sprintf("Suballocated image allocations: %d (%.2f MB)\n", suballocCount, float64(suballocBytes)/(1024*1024)))
+		sb.WriteString(fmt.Sprintf("Total tracked image memory: %.2f MB\n", float64(dedicatedBytes+suballocBytes)/(1024*1024)))
+
+		// Usage ratio vs device-local heap — only count DEVICE_LOCAL allocations.
+		var deviceLocalTracked int64
+		for _, alloc := range a.allocations {
+			if alloc.isDeviceLocal {
+				if alloc.dedicated {
+					deviceLocalTracked += int64(alloc.size)
+				} else {
+					// Suballocated: count proportional share of block memory.
+					deviceLocalTracked += int64(alloc.size)
+				}
+			}
+		}
+		if r.deviceLocalHeapSize > 0 {
+			usageRatio := float64(deviceLocalTracked) / float64(r.deviceLocalHeapSize) * 100
+			sb.WriteString(fmt.Sprintf("Device-local heap usage (tracked): %.1f%%\n", usageRatio))
+		}
+
+		a.mu.Unlock()
+	}
+
+	// VRAM residency stats: count swappable textures by residency state.
+	var deviceLocalCount, hostVisibleCount, swappedOutCount, evictedCount int
+	var deviceLocalBytes, hostVisibleBytes vk.DeviceSize
+	for t := range r.swappableTextures {
+		switch t.residency {
+		case ResidentDeviceLocal:
+			deviceLocalCount++
+			if t.allocation != nil {
+				deviceLocalBytes += t.allocation.size
+			}
+		case ResidentHostVisible:
+			hostVisibleCount++
+			if t.allocation != nil {
+				hostVisibleBytes += t.allocation.size
+			}
+		case ResidentSwappedOut:
+			swappedOutCount++
+		case ResidentEvicted:
+			evictedCount++
+		}
+	}
+	sb.WriteString("=== VRAM Residency ===\n")
+	sb.WriteString(fmt.Sprintf("  DEVICE_LOCAL: %d textures (%.2f MB)\n", deviceLocalCount, float64(deviceLocalBytes)/(1024*1024)))
+	sb.WriteString(fmt.Sprintf("  HOST_VISIBLE: %d textures (%.2f MB)\n", hostVisibleCount, float64(hostVisibleBytes)/(1024*1024)))
+	sb.WriteString(fmt.Sprintf("  Swapped out (host RAM): %d textures\n", swappedOutCount))
+	sb.WriteString(fmt.Sprintf("  Evicted (host RAM only): %d textures\n", evictedCount))
+
+	return sb.String()
+}
+
+func (r *Renderer_VK) NewVulkanDevice(appInfo *vk.ApplicationInfo) error {
+	// create a Vulkan instance.
+	instanceExtensions := sys.window.Window.VulkanGetInstanceExtensions()
+	for i := range instanceExtensions {
+		instanceExtensions[i] = fmt.Sprintf("%s\x00", instanceExtensions[i])
+	}
+	instanceCreateInfo := &vk.InstanceCreateInfo{
+		SType:                   vk.StructureTypeInstanceCreateInfo,
+		PApplicationInfo:        appInfo,
+		EnabledExtensionCount:   uint32(len(instanceExtensions)),
+		PpEnabledExtensionNames: instanceExtensions,
+		EnabledLayerCount:       0,
+		PpEnabledLayerNames:     []string{},
+	}
+	// This causes a crash with it in SDL and without it in GLFW on macOS. Have no idea why.
+	// if runtime.GOOS == "darwin" {
+	// 	instanceExtensions = append(instanceExtensions, vk.KhrPortabilityEnumerationExtensionName+"\x00")
+	// 	instanceCreateInfo.PpEnabledExtensionNames = instanceExtensions
+	// 	instanceCreateInfo.EnabledExtensionCount = uint32(len(instanceExtensions))
+	// 	instanceCreateInfo.Flags = vk.InstanceCreateFlags(vk.InstanceCreateEnumeratePortabilityBit)
+	// }
+	vkDebug = sys.cfg.Video.RendererDebugMode
+	if vkDebug {
+		if r.checkValidationLayerSupport() {
+			instanceCreateInfo.EnabledLayerCount = uint32(len(vk_validationLayers))
+			instanceCreateInfo.PpEnabledLayerNames = vk_validationLayers
+		} else {
+			LogMessage("Vulkan validation layers requested but not available")
+		}
+	}
+	var instance vk.Instance
+	err := vk.Error(vk.CreateInstance(instanceCreateInfo, nil, &instance))
+	if err != nil {
+		err = fmt.Errorf("vkCreateInstance failed with %s", err)
+		return err
+	}
+	r.instance = instance
+	vk.InitInstance(r.instance)
+
+	surface, err := sys.window.VulkanCreateSurface(r.instance)
+	if err != nil {
+		vk.DestroyInstance(r.instance, nil)
+		err = fmt.Errorf("vkCreateWindowSurface failed with %s", err)
+		return err
+	}
+
+	r.surface = vk.SurfaceFromPointer(uintptr(surface))
+
+	if r.gpuDevices, err = r.getPhysicalDevices(r.instance); err != nil {
+		r.gpuDevices = nil
+		vk.DestroyInstance(r.instance, nil)
+		return err
+	}
+	//Try to use discrete GPU, use the first available GPU if discrete GPU is not available
+	r.gpuIndex = 0
+	var gpuProperties vk.PhysicalDeviceProperties
+	for i := range r.gpuDevices {
+		vk.GetPhysicalDeviceProperties(r.gpuDevices[i], &gpuProperties)
+		gpuProperties.Deref()
+		if gpuProperties.DeviceType == vk.PhysicalDeviceTypeDiscreteGpu {
+			r.gpuIndex = uint32(i)
+			break
+		}
+	}
+	//gpuProperties.Limits.Deref()
+	// Safety re-retrieval just in case.
+	vk.GetPhysicalDeviceProperties(r.gpuDevices[r.gpuIndex], &gpuProperties)
+	gpuProperties.Deref()
+	r.maxAnisotropy = gpuProperties.Limits.MaxSamplerAnisotropy
+	r.minUniformBufferOffsetAlignment = uint32(gpuProperties.Limits.MinUniformBufferOffsetAlignment)
+	if runtime.GOOS == "ios" && r.minUniformBufferOffsetAlignment < 16 {
+		r.minUniformBufferOffsetAlignment = 16
+	}
+	r.maxImageArrayLayers = gpuProperties.Limits.MaxImageArrayLayers
+	maxSampleFlag := int32(gpuProperties.Limits.FramebufferColorSampleCounts & gpuProperties.Limits.FramebufferDepthSampleCounts)
+	maxSamples := 1
+	if maxSampleFlag&int32(vk.SampleCount64Bit) > 0 {
+		maxSamples = 64
+	} else if maxSampleFlag&int32(vk.SampleCount32Bit) > 0 {
+		maxSamples = 32
+	} else if maxSampleFlag&int32(vk.SampleCount16Bit) > 0 {
+		maxSamples = 16
+	} else if maxSampleFlag&int32(vk.SampleCount8Bit) > 0 {
+		maxSamples = 8
+	} else if maxSampleFlag&int32(vk.SampleCount4Bit) > 0 {
+		maxSamples = 4
+	} else if maxSampleFlag&int32(vk.SampleCount2Bit) > 0 {
+		maxSamples = 2
+	}
+	if sys.msaa > int32(maxSamples) {
+		sys.cfg.SetValueUpdate("Video.MSAA", maxSamples)
+		sys.msaa = int32(maxSamples)
+	}
+
+	queueCreateInfos := []vk.DeviceQueueCreateInfo{{
+		SType:            vk.StructureTypeDeviceQueueCreateInfo,
+		QueueCount:       1,
+		PQueuePriorities: []float32{1.0},
+	}}
+	deviceExtensions := []string{
+		"VK_KHR_swapchain\x00",
+	}
+
+	// Required for some targets to function (Android is strict)
+	hasDR := r.hasDeviceExtension("VK_KHR_dynamic_rendering")
+	hasSync2 := r.hasDeviceExtension("VK_KHR_synchronization2")
+	hasMV := r.hasDeviceExtension("VK_KHR_multiview")
+	if hasDR {
+		deviceExtensions = append(deviceExtensions, "VK_KHR_dynamic_rendering\x00")
+	}
+	if hasSync2 {
+		deviceExtensions = append(deviceExtensions, "VK_KHR_synchronization2\x00")
+	}
+	if hasMV {
+		deviceExtensions = append(deviceExtensions, "VK_KHR_multiview\x00")
+	}
+
+	// Only enable push descriptors if we can on this hardware (Android in particular usually doesn't support this)
+	if r.hasDeviceExtension("VK_KHR_push_descriptor") {
+		deviceExtensions = append(deviceExtensions, "VK_KHR_push_descriptor\x00")
+		r.hasPushDescriptors = true
+	} else {
+		r.hasPushDescriptors = false
+	}
+
+	// macOS/iOS behavior
+	if r.shouldDoPerDrawPushDrawConstants {
+		deviceExtensions = append(deviceExtensions, "VK_KHR_portability_subset\x00")
+	}
+	deviceCreateInfo := &vk.DeviceCreateInfo{
+		SType:                   vk.StructureTypeDeviceCreateInfo,
+		QueueCreateInfoCount:    uint32(len(queueCreateInfos)),
+		PQueueCreateInfos:       queueCreateInfos,
+		EnabledExtensionCount:   uint32(len(deviceExtensions)),
+		PpEnabledExtensionNames: deviceExtensions,
+	}
+
+	// just some pointer wizardry for dynamic feature enabling
+	var lastPNext *unsafe.Pointer = &deviceCreateInfo.PNext
+
+	var sync2 vk.PhysicalDeviceSynchronization2Features
+	if hasSync2 {
+		sync2 = vk.PhysicalDeviceSynchronization2Features{
+			SType:            vk.StructureTypePhysicalDeviceSynchronization2Features,
+			Synchronization2: vk.True,
+		}
+		*lastPNext = unsafe.Pointer(&sync2)
+		lastPNext = &sync2.PNext
+	}
+	var multiViewFeature vk.PhysicalDeviceMultiviewFeatures
+	if hasMV {
+		multiViewFeature = vk.PhysicalDeviceMultiviewFeatures{
+			SType:     vk.StructureTypePhysicalDeviceMultiviewFeatures,
+			Multiview: vk.True,
+		}
+		*lastPNext = unsafe.Pointer(&multiViewFeature)
+		lastPNext = &multiViewFeature.PNext
+	}
+
+	var dynamicRenderFeature vk.PhysicalDeviceDynamicRenderingFeatures
+	if hasDR {
+		dynamicRenderFeature = vk.PhysicalDeviceDynamicRenderingFeatures{
+			SType:            vk.StructureTypePhysicalDeviceDynamicRenderingFeatures,
+			DynamicRendering: vk.True,
+		}
+		*lastPNext = unsafe.Pointer(&dynamicRenderFeature)
+		lastPNext = &dynamicRenderFeature.PNext
+	}
+
+	// Find out what features we CAN support for broader mobile compatibility
+	var supportedFeats vk.PhysicalDeviceFeatures
+	vk.GetPhysicalDeviceFeatures(r.gpuDevices[r.gpuIndex], &supportedFeats)
+
+	var enabledFeats vk.PhysicalDeviceFeatures
+	if r.maxAnisotropy > 0 && supportedFeats.SamplerAnisotropy == vk.True {
+		enabledFeats.SamplerAnisotropy = vk.True
+	}
+	if sys.cfg.Video.EnableModel && supportedFeats.ImageCubeArray == vk.True {
+		enabledFeats.ImageCubeArray = vk.True
+	}
+
+	// It's apparently best to not enable this on Android (fix Retroid Pocket 6 crash)
+	var vulkan12Features vk.PhysicalDeviceVulkan12Features
+	if sys.cfg.Video.EnableModelShadow && runtime.GOOS != "android" {
+		vulkan12Features = vk.PhysicalDeviceVulkan12Features{
+			SType:                     vk.StructureTypePhysicalDeviceVulkan12Features,
+			ShaderOutputViewportIndex: vk.True,
+			ShaderOutputLayer:         vk.True,
+		}
+		*lastPNext = unsafe.Pointer(&vulkan12Features)
+		lastPNext = &vulkan12Features.PNext
+	}
+	if vkDebug && r.checkValidationLayerSupport() {
+		deviceCreateInfo.EnabledLayerCount = uint32(len(vk_validationLayers))
+		deviceCreateInfo.PpEnabledLayerNames = vk_validationLayers
+	}
+	deviceCreateInfo.PEnabledFeatures = []vk.PhysicalDeviceFeatures{enabledFeats}
+	var device vk.Device
+	err = vk.Error(vk.CreateDevice(r.gpuDevices[r.gpuIndex], deviceCreateInfo, nil, &device))
+	if err != nil {
+		//r.gpuDevices = nil
+		vk.DestroySurface(r.instance, r.surface, nil)
+		vk.DestroyInstance(r.instance, nil)
+		err = fmt.Errorf("vkCreateDevice failed with %s", err)
+		return err
+	} else {
+		r.device = device
+		// Fallback behavior
+		if !r.hasPushDescriptors {
+			poolSizes := []vk.DescriptorPoolSize{
+				{Type: vk.DescriptorTypeUniformBuffer, DescriptorCount: 4096 * 4},         // TODO: just pulled these outta nowhere
+				{Type: vk.DescriptorTypeCombinedImageSampler, DescriptorCount: 4096 * 12}, // TODO: just pulled these outta nowhere
+			}
+
+			poolInfo := vk.DescriptorPoolCreateInfo{
+				SType:         vk.StructureTypeDescriptorPoolCreateInfo,
+				MaxSets:       4096, // TODO: just pulled this outta nowhere
+				PoolSizeCount: uint32(len(poolSizes)),
+				PPoolSizes:    poolSizes,
+			}
+
+			var descriptorPool vk.DescriptorPool
+			if res := vk.CreateDescriptorPool(r.device, &poolInfo, nil, &descriptorPool); res != vk.Success {
+				panic(fmt.Sprintf("Failed to create descriptor pool: %v", res))
+			}
+			r.droidDescriptorPool = descriptorPool
+			r.droidBindingState = make(map[*VulkanProgramInfo]map[uint32]vk.WriteDescriptorSet)
+		}
+		var queue vk.Queue
+		vk.GetDeviceQueue(device, 0, 0, &queue)
+		r.queue = queue
+	}
+
+	return nil
+}
+
+func (r *Renderer_VK) getPhysicalDevices(instance vk.Instance) ([]vk.PhysicalDevice, error) {
+	var gpuCount uint32
+	err := vk.Error(vk.EnumeratePhysicalDevices(instance, &gpuCount, nil))
+	if err != nil {
+		err = fmt.Errorf("vkEnumeratePhysicalDevices failed with %s", err)
+		return nil, err
+	}
+	if gpuCount == 0 {
+		err = fmt.Errorf("getPhysicalDevice: no GPUs found on the system")
+		return nil, err
+	}
+	gpuList := make([]vk.PhysicalDevice, gpuCount)
+	err = vk.Error(vk.EnumeratePhysicalDevices(instance, &gpuCount, gpuList))
+	if err != nil {
+		err = fmt.Errorf("vkEnumeratePhysicalDevices failed with %s", err)
+		return nil, err
+	}
+	return gpuList, nil
+}
+
+func (r *Renderer_VK) physicalDeviceType(dev vk.PhysicalDeviceType) string {
+	switch dev {
+	case vk.PhysicalDeviceTypeIntegratedGpu:
+		return "Integrated GPU"
+	case vk.PhysicalDeviceTypeDiscreteGpu:
+		return "Discrete GPU"
+	case vk.PhysicalDeviceTypeVirtualGpu:
+		return "Virtual GPU"
+	case vk.PhysicalDeviceTypeCpu:
+		return "CPU"
+	case vk.PhysicalDeviceTypeOther:
+		return "Other"
+	default:
+		return "Unknown"
+	}
+}
+
+func (r *Renderer_VK) GetPresentMode(vsync bool) vk.PresentMode {
+	if !vsync {
+		var presentModeCount uint32
+		err := vk.Error(vk.GetPhysicalDeviceSurfacePresentModes(r.gpuDevices[r.gpuIndex], r.surface, &presentModeCount, nil))
+		if err != nil {
+			err = fmt.Errorf("vkGetPhysicalDeviceSurfacePresentModesKHR failed with %s", err)
+			panic(err)
+		}
+		if presentModeCount > 0 {
+			presentModes := make([]vk.PresentMode, presentModeCount)
+			err := vk.Error(vk.GetPhysicalDeviceSurfacePresentModes(r.gpuDevices[r.gpuIndex], r.surface, &presentModeCount, presentModes))
+			if err != nil {
+				err = fmt.Errorf("vkGetPhysicalDeviceSurfacePresentModes failed with %s", err)
+				panic(err)
+			}
+			for i := range presentModes {
+				if presentModes[i] == vk.PresentModeMailbox {
+					return vk.PresentModeMailbox
+				}
+				if presentModes[i] == vk.PresentModeImmediate {
+					return vk.PresentModeImmediate
+				}
+			}
+		}
+	}
+	return vk.PresentModeFifo
+}
+
+func (r *Renderer_VK) PrintInfo() {
+	var gpuProperties vk.PhysicalDeviceProperties
+	vk.GetPhysicalDeviceProperties(r.gpuDevices[r.gpuIndex], &gpuProperties)
+	gpuProperties.Deref()
+
+	LogMessage("VULKAN PROPERTIES AND SURFACE CAPABILITES")
+	LogMessage("%v", vk.ToString(gpuProperties.DeviceName[:]))
+	LogMessage("%v", fmt.Sprintf("%x", gpuProperties.VendorID))
+	LogMessage("%v", r.physicalDeviceType(gpuProperties.DeviceType))
+	LogMessage("%v", len(r.gpuDevices))
+	LogMessage("%v", vk.Version(gpuProperties.ApiVersion))
+	LogMessage("%v", vk.Version(gpuProperties.DriverVersion))
+
+	LogMessage("VULKAN SUPPORTED DEVICE EXTENSIONS")
+	var extensionCount uint32
+	var extensionProperties []vk.ExtensionProperties
+	vk.EnumerateDeviceExtensionProperties(r.gpuDevices[r.gpuIndex], "", &extensionCount, nil)
+	extensionProperties = make([]vk.ExtensionProperties, extensionCount)
+	vk.EnumerateDeviceExtensionProperties(r.gpuDevices[r.gpuIndex], "", &extensionCount, extensionProperties)
+	for i := range extensionProperties {
+		extensionProperties[i].Deref()
+		LogMessage("%v", vk.ToString(extensionProperties[i].ExtensionName[:]))
+	}
+}
+
+func (r *Renderer_VK) checkValidationLayerSupport() bool {
+	var layerCount uint32
+	var layerProperties []vk.LayerProperties
+	vk.EnumerateInstanceLayerProperties(&layerCount, nil)
+	layerProperties = make([]vk.LayerProperties, layerCount)
+	err := vk.Error(vk.EnumerateInstanceLayerProperties(&layerCount, layerProperties))
+	if err != nil {
+		panic(err)
+	}
+	for _, layerName := range vk_validationLayers {
+		for _, layerProperty := range layerProperties {
+			layerProperty.Deref()
+			s := vk.ToString(layerProperty.LayerName[:])
+			if s == layerName[:len(layerName)-1] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasDeviceExtension checks whether a device extension is supported by the GPU.
+func (r *Renderer_VK) hasDeviceExtension(extensionName string) bool {
+	var extensionCount uint32
+	vk.EnumerateDeviceExtensionProperties(r.gpuDevices[r.gpuIndex], "", &extensionCount, nil)
+	extensionProperties := make([]vk.ExtensionProperties, extensionCount)
+	vk.EnumerateDeviceExtensionProperties(r.gpuDevices[r.gpuIndex], "", &extensionCount, extensionProperties)
+	for i := range extensionProperties {
+		extensionProperties[i].Deref()
+		name := vk.ToString(extensionProperties[i].ExtensionName[:])
+		if name == extensionName {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Renderer_VK) CreateRenderTarget(renderpass vk.RenderPass, width, height uint32, numSamples int32, createDepthTexture bool) *VulkanRenderTargetInfo {
+	var rt VulkanRenderTargetInfo
+	rt.texture = r.CreateRenderTargetTexture(width, height, numSamples, createDepthTexture)
+	if createDepthTexture {
+		rt.depthTexture = r.CreateRenderTargetDepthTexture(width, height, numSamples)
+		rt.framebuffer = r.CreateRenderTargetFramebuffer(width, height, []vk.ImageView{rt.texture.imageView, rt.depthTexture.imageView}, renderpass, 1)
+	} else {
+		rt.framebuffer = r.CreateRenderTargetFramebuffer(width, height, []vk.ImageView{rt.texture.imageView}, renderpass, 1)
+	}
+	return &rt
+}
+
+func (r *Renderer_VK) CreateRenderTargetTexture(width, height uint32, numSamples int32, main bool) *Texture_VK {
+	t := &Texture_VK{int32(width), int32(height), 32, false, 1, [2]int32{0, 0}, [4]float32{0, 0, 1, 1}, nil, nil, nil, nil, ResidentDeviceLocal, 0, nil, false, false, false}
+	usage := vk.ImageUsageFlags(vk.ImageUsageColorAttachmentBit | vk.ImageUsageTransferSrcBit)
+	if !main {
+		usage = usage | vk.ImageUsageFlags(vk.ImageUsageSampledBit) | vk.ImageUsageFlags(vk.ImageUsageTransferDstBit)
+	}
+	t.img = r.CreateImage(width, height, r.swapchains[0].format, 1, 1, usage, numSamples, vk.ImageTilingOptimal, false)
+
+	alloc, err := r.allocator.AllocateImageMemory(t.img, vk.MemoryPropertyDeviceLocalBit)
+	if err != nil {
+		panic(fmt.Errorf("newCubeMapTexture: AllocateImageMemory failed: %w", err))
+	}
+	t.allocation = alloc
+	t.imageView = r.CreateImageView(t.img, r.swapchains[0].format, 0, 1, 1, false)
+
+	runtime.SetFinalizer(t, func(t *Texture_VK) {
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypeTexture,
+			[]interface{}{t.img, t.imageView, t.sampler, t.allocation},
+		}
+	})
+	return t
+}
+
+func (r *Renderer_VK) FindSupportedDepthFormat() vk.Format {
+	// Priority order from highest precision to broad iOS/MoltenVK compatibility
+	candidates := []vk.Format{
+		vk.FormatD32Sfloat,
+		vk.FormatD32SfloatS8Uint,
+		vk.FormatD24UnormS8Uint,
+		vk.FormatD16Unorm,
+	}
+
+	tiling := vk.ImageTilingOptimal
+	features := vk.FormatFeatureFlags(vk.FormatFeatureDepthStencilAttachmentBit)
+
+	for _, format := range candidates {
+		var props vk.FormatProperties
+		vk.GetPhysicalDeviceFormatProperties(r.gpuDevices[r.gpuIndex], format, &props)
+
+		if (tiling == vk.ImageTilingLinear && (props.LinearTilingFeatures&features) == features) ||
+			(tiling == vk.ImageTilingOptimal && (props.OptimalTilingFeatures&features) == features) {
+			return format
+		}
+	}
+
+	// Default fallback if query yields nothing
+	return vk.FormatD16Unorm
+}
+
+func (r *Renderer_VK) CreateRenderTargetDepthTexture(width, height uint32, numSamples int32) *Texture_VK {
+	t := &Texture_VK{int32(width), int32(height), 32, false, 1, [2]int32{0, 0}, [4]float32{0, 0, 1, 1}, nil, nil, nil, nil, ResidentDeviceLocal, 0, nil, false, false, false}
+	usage := vk.ImageUsageFlags(vk.ImageUsageDepthStencilAttachmentBit)
+	if numSamples > 1 {
+		usage = usage | vk.ImageUsageFlags(vk.ImageUsageTransferSrcBit)
+	}
+	depthFormat := r.FindSupportedDepthFormat()
+
+	t.img = r.CreateImage(width, height, depthFormat, 1, 1, usage, numSamples, vk.ImageTilingOptimal, false)
+
+	alloc, err := r.allocator.AllocateImageMemory(t.img, vk.MemoryPropertyDeviceLocalBit)
+	if err != nil {
+		panic(fmt.Errorf("newDummyCubeMapTexture: AllocateImageMemory failed: %w", err))
+	}
+	t.allocation = alloc
+	t.imageView = r.CreateImageView(t.img, depthFormat, 0, 1, 1, false)
+
+	runtime.SetFinalizer(t, func(t *Texture_VK) {
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypeTexture,
+			[]interface{}{t.img, t.imageView, t.sampler, t.allocation},
+		}
+	})
+	commandBuffer := r.BeginSingleTimeCommands()
+	barriers := []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutDepthStencilAttachmentOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessDepthStencilAttachmentReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectDepthBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageLateFragmentTestsBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+	vk.EndCommandBuffer(commandBuffer)
+	r.tempCommands = append(gfx.(*Renderer_VK).tempCommands, commandBuffer)
+	return t
+}
+func (r *Renderer_VK) CreateRenderTargetFramebuffer(width, height uint32, attachments []vk.ImageView, renderPass vk.RenderPass, layer uint32) vk.Framebuffer {
+	var framebuffer vk.Framebuffer
+	fbCreateInfo := vk.FramebufferCreateInfo{
+		SType:           vk.StructureTypeFramebufferCreateInfo,
+		RenderPass:      renderPass,
+		Layers:          layer,
+		AttachmentCount: uint32(len(attachments)), // 2 if has depthView
+		PAttachments:    attachments,
+		Width:           width,
+		Height:          height,
+	}
+	err := vk.Error(vk.CreateFramebuffer(r.device, &fbCreateInfo, nil, &framebuffer))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateFramebuffer failed with %s", err)
+		panic(err)
+	}
+	return framebuffer
+}
+
+func (r *Renderer_VK) createPalTexture(size uint32) {
+	r.palTexture.size = size
+	r.palTexture.textures = make([]*Texture_VK, 0, 1)
+	r.palTexture.emptySlot = list.New()
+	r.addPalTexture()
+}
+
+func (r *Renderer_VK) addPalTexture() {
+	index := uint32(len(r.palTexture.textures))
+	for i := uint32(0); i < r.palTexture.size; i++ {
+		r.palTexture.emptySlot.PushBack([2]uint32{index, uint32(i)})
+	}
+	t := &Texture_VK{int32(r.palTexture.size), int32(r.palTexture.size), 32, false, 1, [2]int32{0, 0}, [4]float32{0, 0, 1, 1}, nil, nil, nil, nil, ResidentDeviceLocal, 0, nil, false, false, false}
+	t.img = r.CreateImage(uint32(t.width), uint32(t.height), vk.FormatR8g8b8a8Unorm, 1, 1, vk.ImageUsageFlags(vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), 1, vk.ImageTilingLinear, false)
+
+	alloc, err := r.allocator.AllocateImageMemory(t.img, vk.MemoryPropertyDeviceLocalBit)
+	if err != nil {
+		panic(fmt.Errorf("addPalTexture: AllocateImageMemory failed: %w", err))
+	}
+	t.allocation = alloc
+	t.imageView = r.CreateImageView(t.img, vk.FormatR8g8b8a8Unorm, 0, 1, 1, false)
+	r.palTexture.textures = append(r.palTexture.textures, t)
+
+	runtime.SetFinalizer(t, func(t *Texture_VK) {
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypeTexture,
+			[]interface{}{t.img, t.imageView, t.sampler, t.allocation},
+		}
+	})
+
+	r.poolMutex.Lock()
+	commandBuffer := r.BeginSingleTimeCommands()
+	r.poolMutex.Unlock()
+	barrier := vk.ImageMemoryBarrier{
+		SType:               vk.StructureTypeImageMemoryBarrier,
+		OldLayout:           vk.ImageLayoutUndefined,
+		NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+		SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+		DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+		SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+		DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+		Image:               t.img,
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   0,
+			LevelCount:     1,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+	}
+	vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, 1, []vk.ImageMemoryBarrier{barrier})
+	r.poolMutex.Lock()
+	r.EndSingleTimeCommands(commandBuffer)
+	r.poolMutex.Unlock()
+}
+func (r *Renderer_VK) createShadowMapTexture(widthHeight int32) *Texture_VK {
+	t := &Texture_VK{widthHeight, widthHeight, 96, false, 1, [2]int32{0, 0}, [4]float32{0, 0, 1, 1}, nil, nil, nil, nil, ResidentDeviceLocal, 0, nil, false, false, false}
+	t.sampler = r.GetSampler(VulkanSamplerInfo{TextureSamplingFilterNearest, TextureSamplingFilterNearest, TextureSamplingWrapClampToEdge, TextureSamplingWrapClampToEdge})
+	format := r.FindSupportedDepthFormat()
+	t.img = r.CreateImage(uint32(widthHeight), uint32(widthHeight), format, 1, 6*4, vk.ImageUsageFlags(vk.ImageUsageDepthStencilAttachmentBit|vk.ImageUsageSampledBit), 1, vk.ImageTilingOptimal, true)
+
+	alloc, err := r.allocator.AllocateImageMemory(t.img, vk.MemoryPropertyDeviceLocalBit)
+	if err != nil {
+		panic(fmt.Errorf("createShadowMapTexture: AllocateImageMemory failed: %w", err))
+	}
+	t.allocation = alloc
+	t.imageView = r.CreateImageView(t.img, format, 0, 1, 6*4, true)
+	commandBuffer := gfx.(*Renderer_VK).BeginSingleTimeCommands()
+
+	barriers := []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               t.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectDepthBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     6 * 4,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+	vk.EndCommandBuffer(commandBuffer)
+	r.tempCommands = append(gfx.(*Renderer_VK).tempCommands, commandBuffer)
+
+	runtime.SetFinalizer(t, func(t *Texture_VK) {
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypeTexture,
+			[]interface{}{t.img, t.imageView, t.sampler, t.allocation},
+		}
+	})
+	return t
+}
+
+func (r *Renderer_VK) CreateBuffer(size vk.DeviceSize, usage vk.BufferUsageFlags, properties vk.MemoryPropertyFlagBits, bufferMemory *vk.DeviceMemory) (vk.Buffer, error) {
+	queueFamilyIdx := []uint32{0}
+	bufferCreateInfo := vk.BufferCreateInfo{
+		SType:                 vk.StructureTypeBufferCreateInfo,
+		Size:                  size,
+		Usage:                 usage,
+		SharingMode:           vk.SharingModeExclusive,
+		QueueFamilyIndexCount: 1,
+		PQueueFamilyIndices:   queueFamilyIdx,
+	}
+	var buffer vk.Buffer
+	err := vk.Error(vk.CreateBuffer(r.device, &bufferCreateInfo, nil, &buffer))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateBuffer failed with %s", err)
+		return nil, err
+	}
+	var memReq vk.MemoryRequirements
+	vk.GetBufferMemoryRequirements(r.device, buffer, &memReq)
+	//memReq.Deref()
+
+	// Use allocator for buffer memory
+	alloc, err := r.allocator.AllocateBufferMemory(buffer, memReq.MemoryTypeBits, properties)
+	if err != nil {
+		err = fmt.Errorf("allocator.AllocateBufferMemory failed with %s", err)
+		return buffer, err
+	}
+	*bufferMemory = alloc.deviceMemory
+
+	return buffer, nil
+}
+func (r *Renderer_VK) CreateSwapchain(oldSwapChain vk.Swapchain) error {
+	gpu := r.gpuDevices[r.gpuIndex]
+
+	var surfaceCapabilities vk.SurfaceCapabilities
+	err := vk.Error(vk.GetPhysicalDeviceSurfaceCapabilities(gpu, r.surface, &surfaceCapabilities))
+	if err != nil {
+		err = fmt.Errorf("vk.GetPhysicalDeviceSurfaceCapabilities failed with %s", err)
+		return err
+	}
+	var formatCount uint32
+	vk.GetPhysicalDeviceSurfaceFormats(gpu, r.surface, &formatCount, nil)
+	formats := make([]vk.SurfaceFormat, formatCount)
+	vk.GetPhysicalDeviceSurfaceFormats(gpu, r.surface, &formatCount, formats)
+
+	chosenFormat := -1
+	for i := 0; i < int(formatCount); i++ {
+		//formats[i].Deref()
+		if formats[i].Format == vk.FormatB8g8r8a8Unorm || formats[i].Format == vk.FormatR8g8b8a8Unorm {
+			chosenFormat = i
+			break
+		}
+	}
+	if chosenFormat < 0 {
+		if len(formats) > 0 {
+			fmt.Printf("Choosing fallback SurfaceFormat")
+			//formats[0].Deref()
+			chosenFormat = 0
+			fmt.Printf("Falling back on surface format: %v", formats[0].Format)
+		} else {
+			err := fmt.Errorf("vk.GetPhysicalDeviceSurfaceFormats not found suitable format")
+			return err
+		}
+
+	}
+
+	//surfaceCapabilities.Deref()
+	imageExtent := surfaceCapabilities.CurrentExtent
+
+	// Fix Retroid Pocket 6 view
+	var preTransform vk.SurfaceTransformFlagBits
+	if runtime.GOOS == "android" {
+		preTransform = vk.SurfaceTransformFlagBits(vk.SurfaceTransformIdentityBit)
+	} else {
+		preTransform = surfaceCapabilities.CurrentTransform
+	}
+
+	// only do this if the reported size is settable; otherwise use the current extent (Mobile view fix)
+	if imageExtent.Width == 0xFFFFFFFF || imageExtent.Height == 0xFFFFFFFF || runtime.GOOS == "android" {
+		width, height := sys.window.GetDrawablePixelSize()
+		imageExtent.Width = uint32(width)
+		imageExtent.Height = uint32(height)
+	}
+	queueFamily := []uint32{0}
+	var supportedCompositeAlpha vk.CompositeAlphaFlagBits
+
+	if (surfaceCapabilities.SupportedCompositeAlpha & vk.CompositeAlphaFlags(vk.CompositeAlphaOpaqueBit)) != 0 {
+		supportedCompositeAlpha = vk.CompositeAlphaOpaqueBit
+	} else if (surfaceCapabilities.SupportedCompositeAlpha & vk.CompositeAlphaFlags(vk.CompositeAlphaInheritBit)) != 0 {
+		supportedCompositeAlpha = vk.CompositeAlphaInheritBit
+	} else {
+		supportedCompositeAlpha = vk.CompositeAlphaPreMultipliedBit
+	}
+	var clipped vk.Bool32 = vk.False
+	if runtime.GOOS == "ios" {
+		clipped = vk.True
+	}
+	swapchainCreateInfo := vk.SwapchainCreateInfo{
+		SType:           vk.StructureTypeSwapchainCreateInfo,
+		Surface:         r.surface,
+		MinImageCount:   surfaceCapabilities.MinImageCount + 1,
+		ImageFormat:     formats[chosenFormat].Format,
+		ImageColorSpace: formats[chosenFormat].ColorSpace,
+		ImageExtent:     imageExtent,
+		ImageUsage:      vk.ImageUsageFlags(vk.ImageUsageColorAttachmentBit | vk.ImageUsageTransferSrcBit),
+		PreTransform:    preTransform,
+
+		ImageArrayLayers:      1,
+		ImageSharingMode:      vk.SharingModeExclusive,
+		CompositeAlpha:        supportedCompositeAlpha,
+		QueueFamilyIndexCount: 1,
+		PQueueFamilyIndices:   queueFamily,
+		PresentMode:           r.GetPresentMode(sys.cfg.Video.VSync > 0),
+		Clipped:               clipped,
+		OldSwapchain:          oldSwapChain,
+	}
+	r.swapchains = make([]*VulkanSwapchainInfo, 1)
+	r.swapchains[0] = &VulkanSwapchainInfo{}
+	r.swapchains[0].currentImageIndex = 0
+	err = vk.Error(vk.CreateSwapchain(r.device, &swapchainCreateInfo, nil, &(r.swapchains[0].swapchain)))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateSwapchain failed with %s", err)
+		return err
+	}
+	err = vk.Error(vk.GetSwapchainImages(r.device, r.swapchains[0].swapchain, &r.swapchains[0].imageCount, nil))
+	if err != nil {
+		err = fmt.Errorf("vk.GetSwapchainImages failed with %s", err)
+		return err
+	}
+	r.swapchains[0].images = make([]vk.Image, r.swapchains[0].imageCount)
+	err = vk.Error(vk.GetSwapchainImages(r.device, r.swapchains[0].swapchain, &r.swapchains[0].imageCount, r.swapchains[0].images))
+	if err != nil {
+		err = fmt.Errorf("vk.GetSwapchainImages failed with %s", err)
+		return err
+	}
+	r.swapchains[0].format = formats[chosenFormat].Format
+	r.swapchains[0].extent = imageExtent
+	//r.swapchains[0].extent.Deref()
+	// for i := range formats {
+	// 	formats[i].Free()
+	// }
+	r.CreateSwapchainImageViews(r.swapchains[0])
+	return nil
+}
+func (r *Renderer_VK) CreateSwapchainImageViews(swapchain *VulkanSwapchainInfo) error {
+	swapchain.imageViews = make([]vk.ImageView, len(swapchain.images))
+	for i := range swapchain.images {
+		swapchain.imageViews[i] = r.CreateImageView(swapchain.images[i], swapchain.format, 0, 1, 1, false)
+	}
+	return nil
+}
+
+// Used for Android Activity resume
+func (r *Renderer_VK) RecreateSurfaceAndSwapchain() {
+	r.surfaceMutex.Lock()
+	defer r.surfaceMutex.Unlock()
+	vk.DeviceWaitIdle(r.device)
+
+	// Store the old sets (we cannot recreate them on mobile)
+	var oldSets []vk.DescriptorSet = make([]vk.DescriptorSet, 2)
+	for i := 0; i < 2; i++ {
+		oldSets[i] = r.renderTargets[i].descriptorSet
+	}
+
+	if r.renderTargets[0] != nil {
+		r.DestroyRenderTarget(r.renderTargets[0])
+		r.DestroyRenderTarget(r.renderTargets[1])
+		r.DestroyRenderTarget(r.mainRenderTarget)
+	}
+	r.DestroySwapchain()
+
+	if r.surface != vk.NullSurface {
+		vk.DestroySurface(r.instance, r.surface, nil)
+		r.surface = vk.NullSurface
+	}
+
+	surface, err := sys.window.VulkanCreateSurface(r.instance)
+	if err != nil {
+		vk.DestroyInstance(r.instance, nil)
+		err = fmt.Errorf("[Recreate] vkCreateWindowSurface failed with %s", err)
+		panic(err)
+	}
+	r.surface = vk.SurfaceFromPointer(uintptr(surface))
+
+	err = r.CreateSwapchain(vk.NullSwapchain)
+	if err != nil {
+		r.surfaceLost = true
+		return
+	}
+	err = r.CreateSwapChainFramebuffer(r.swapchains[0], r.swapchainRenderPass.renderPass)
+	if err != nil {
+		r.surfaceLost = true
+		return
+	}
+
+	msaa := sys.msaa
+	if msaa <= 0 {
+		msaa = 1
+	}
+
+	// Recreate the targets
+	r.renderTargets[0] = r.CreateRenderTarget(r.swapchainRenderPass.renderPass, uint32(sys.scrrect[2]), uint32(sys.scrrect[3]), 1, false)
+	r.renderTargets[1] = r.CreateRenderTarget(r.swapchainRenderPass.renderPass, uint32(sys.scrrect[2]), uint32(sys.scrrect[3]), 1, false)
+	r.mainRenderTarget = r.CreateRenderTarget(r.mainRenderPass.renderPass, uint32(sys.scrrect[2]), uint32(sys.scrrect[3]), msaa, true)
+
+	// Reassign persistent sets & update their texture bindings
+	for i := 0; i < 2; i++ {
+		// Assign the persistent descriptor set handle back to the render target
+		r.renderTargets[i].descriptorSet = oldSets[i]
+
+		imageInfo := []vk.DescriptorImageInfo{{
+			Sampler:     r.spriteSamplers[i],
+			ImageView:   r.renderTargets[i].texture.imageView,
+			ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
+		}}
+
+		writeDS := []vk.WriteDescriptorSet{{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstSet:          r.renderTargets[i].descriptorSet,
+			DstBinding:      0,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			PImageInfo:      imageInfo,
+		}}
+
+		vk.UpdateDescriptorSets(r.device, 1, writeDS, 0, nil)
+	}
+
+	r.surfaceLost = false
+	sys.window.renderingPaused = false
+}
+func (r *Renderer_VK) RecreateSwapchain() {
+	vk.DeviceWaitIdle(r.device)
+	// Store the old sets (we cannot recreate them on mobile)
+	var oldSets []vk.DescriptorSet = make([]vk.DescriptorSet, 2)
+	for i := 0; i < 2; i++ {
+		oldSets[i] = r.renderTargets[i].descriptorSet
+	}
+
+	oldChain := r.swapchains[0].swapchain
+	if r.renderTargets[0] != nil {
+		r.DestroyRenderTarget(r.renderTargets[0])
+		r.DestroyRenderTarget(r.renderTargets[1])
+		r.DestroyRenderTarget(r.mainRenderTarget)
+	}
+
+	err := r.CreateSwapchain(oldChain)
+	if err != nil {
+		panic(err)
+	}
+	err = r.CreateSwapChainFramebuffer(r.swapchains[0], r.swapchainRenderPass.renderPass)
+	if err != nil {
+		panic(err)
+	}
+
+	msaa := sys.msaa
+	if msaa <= 0 {
+		msaa = 1
+	}
+
+	// Recreate the targets
+	r.renderTargets[0] = r.CreateRenderTarget(r.swapchainRenderPass.renderPass, uint32(sys.scrrect[2]), uint32(sys.scrrect[3]), 1, false)
+	r.renderTargets[1] = r.CreateRenderTarget(r.swapchainRenderPass.renderPass, uint32(sys.scrrect[2]), uint32(sys.scrrect[3]), 1, false)
+	r.mainRenderTarget = r.CreateRenderTarget(r.mainRenderPass.renderPass, uint32(sys.scrrect[2]), uint32(sys.scrrect[3]), msaa, true)
+
+	// Reassign persistent sets & update their texture bindings
+	for i := 0; i < 2; i++ {
+		// Assign the persistent descriptor set handle back to the render target
+		r.renderTargets[i].descriptorSet = oldSets[i]
+
+		imageInfo := []vk.DescriptorImageInfo{{
+			Sampler:     r.spriteSamplers[i],
+			ImageView:   r.renderTargets[i].texture.imageView,
+			ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
+		}}
+
+		writeDS := []vk.WriteDescriptorSet{{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstSet:          r.renderTargets[i].descriptorSet,
+			DstBinding:      0,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			PImageInfo:      imageInfo,
+		}}
+
+		vk.UpdateDescriptorSets(r.device, 1, writeDS, 0, nil)
+	}
+
+	// Must do this explicitly instead of calling r.DestroySwapchain()
+	if oldChain != vk.NullSwapchain {
+		vk.DestroySwapchain(r.device, oldChain, nil)
+	}
+}
+func (r *Renderer_VK) CreateMainRenderPass(sweapchain *VulkanSwapchainInfo, numSamples int32, containsDepthTexture bool) (*VulkanRenderInfo, error) {
+	attachmentDescriptions := []vk.AttachmentDescription{
+		{
+			Format:         sweapchain.format,
+			Samples:        vk.SampleCountFlagBits(numSamples),
+			LoadOp:         vk.AttachmentLoadOpClear,
+			StoreOp:        vk.AttachmentStoreOpStore,
+			StencilLoadOp:  vk.AttachmentLoadOpDontCare,
+			StencilStoreOp: vk.AttachmentStoreOpDontCare,
+			InitialLayout:  vk.ImageLayoutUndefined,
+			FinalLayout:    vk.ImageLayoutColorAttachmentOptimal,
+		},
+	}
+	colorAttachments := []vk.AttachmentReference{
+		{
+			Attachment: 0,
+			Layout:     vk.ImageLayoutColorAttachmentOptimal,
+		},
+	}
+	subpassDescriptions := []vk.SubpassDescription{{
+		PipelineBindPoint:    vk.PipelineBindPointGraphics,
+		ColorAttachmentCount: 1,
+		PColorAttachments:    colorAttachments,
+	}}
+	if containsDepthTexture {
+		attachmentDescriptions = append(attachmentDescriptions, vk.AttachmentDescription{
+			Format:         r.FindSupportedDepthFormat(),
+			Samples:        vk.SampleCountFlagBits(numSamples),
+			LoadOp:         vk.AttachmentLoadOpClear,
+			StoreOp:        vk.AttachmentStoreOpStore,
+			StencilLoadOp:  vk.AttachmentLoadOpDontCare,
+			StencilStoreOp: vk.AttachmentStoreOpDontCare,
+			InitialLayout:  vk.ImageLayoutUndefined,
+			FinalLayout:    vk.ImageLayoutDepthStencilAttachmentOptimal,
+		})
+		colorAttachments = append(colorAttachments, vk.AttachmentReference{
+			Attachment: 1,
+			Layout:     vk.ImageLayoutDepthStencilAttachmentOptimal,
+		})
+		subpassDescriptions[0].PDepthStencilAttachment = &vk.AttachmentReference{
+			Attachment: 1,
+			Layout:     vk.ImageLayoutDepthStencilAttachmentOptimal,
+		}
+	}
+	renderPassCreateInfo := vk.RenderPassCreateInfo{
+		SType:           vk.StructureTypeRenderPassCreateInfo,
+		AttachmentCount: uint32(len(attachmentDescriptions)),
+		PAttachments:    attachmentDescriptions,
+		SubpassCount:    uint32(len(subpassDescriptions)),
+		PSubpasses:      subpassDescriptions,
+	}
+	renderInfo := &VulkanRenderInfo{}
+	err := vk.Error(vk.CreateRenderPass(r.device, &renderPassCreateInfo, nil, &renderInfo.renderPass))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateRenderPass failed with %s", err)
+		return nil, err
+	}
+	return renderInfo, nil
+}
+func (r *Renderer_VK) CreatePostProcessingRenderPass(sweapchain *VulkanSwapchainInfo) (*VulkanRenderInfo, error) {
+	attachmentDescriptions := []vk.AttachmentDescription{{
+		Format:         sweapchain.format,
+		Samples:        vk.SampleCount1Bit,
+		LoadOp:         vk.AttachmentLoadOpClear,
+		StoreOp:        vk.AttachmentStoreOpStore,
+		StencilLoadOp:  vk.AttachmentLoadOpDontCare,
+		StencilStoreOp: vk.AttachmentStoreOpDontCare,
+		InitialLayout:  vk.ImageLayoutUndefined,
+		FinalLayout:    vk.ImageLayoutShaderReadOnlyOptimal,
+	}}
+	colorAttachments := []vk.AttachmentReference{{
+		Attachment: 0,
+		Layout:     vk.ImageLayoutColorAttachmentOptimal,
+	}}
+	subpassDescriptions := []vk.SubpassDescription{{
+		PipelineBindPoint:    vk.PipelineBindPointGraphics,
+		ColorAttachmentCount: 1,
+		PColorAttachments:    colorAttachments,
+	}}
+	subpassDependencies := []vk.SubpassDependency{{
+		SrcSubpass:      vk.SubpassExternal,
+		DstSubpass:      0,
+		SrcStageMask:    vk.PipelineStageFlags(vk.PipelineStageAllGraphicsBit),
+		DstStageMask:    vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit),
+		SrcAccessMask:   vk.AccessFlags(vk.AccessColorAttachmentWriteBit | vk.AccessShaderWriteBit),
+		DstAccessMask:   vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+		DependencyFlags: 0,
+	}}
+	renderPassCreateInfo := vk.RenderPassCreateInfo{
+		SType:           vk.StructureTypeRenderPassCreateInfo,
+		AttachmentCount: 1,
+		PAttachments:    attachmentDescriptions,
+		SubpassCount:    1,
+		PSubpasses:      subpassDescriptions,
+		DependencyCount: 1,
+		PDependencies:   subpassDependencies,
+	}
+	renderInfo := &VulkanRenderInfo{}
+	err := vk.Error(vk.CreateRenderPass(r.device, &renderPassCreateInfo, nil, &renderInfo.renderPass))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateRenderPass failed with %s", err)
+		return nil, err
+	}
+	return renderInfo, nil
+}
+func (r *Renderer_VK) CreateSwapchainRenderPass(sweapchain *VulkanSwapchainInfo) (*VulkanRenderInfo, error) {
+	attachmentDescriptions := []vk.AttachmentDescription{{
+		Format:         sweapchain.format,
+		Samples:        vk.SampleCount1Bit,
+		LoadOp:         vk.AttachmentLoadOpClear,
+		StoreOp:        vk.AttachmentStoreOpStore,
+		StencilLoadOp:  vk.AttachmentLoadOpDontCare,
+		StencilStoreOp: vk.AttachmentStoreOpDontCare,
+		InitialLayout:  vk.ImageLayoutUndefined,
+		FinalLayout:    vk.ImageLayoutPresentSrc,
+	}}
+	colorAttachments := []vk.AttachmentReference{{
+		Attachment: 0,
+		Layout:     vk.ImageLayoutColorAttachmentOptimal,
+	}}
+	subpassDescriptions := []vk.SubpassDescription{{
+		PipelineBindPoint:    vk.PipelineBindPointGraphics,
+		ColorAttachmentCount: 1,
+		PColorAttachments:    colorAttachments,
+	}}
+	subpassDependencies := []vk.SubpassDependency{{
+		SrcSubpass:      vk.SubpassExternal,
+		DstSubpass:      0,
+		SrcStageMask:    vk.PipelineStageFlags(vk.PipelineStageAllGraphicsBit),
+		DstStageMask:    vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit),
+		SrcAccessMask:   vk.AccessFlags(vk.AccessColorAttachmentWriteBit | vk.AccessShaderWriteBit),
+		DstAccessMask:   vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+		DependencyFlags: 0,
+	}}
+	renderPassCreateInfo := vk.RenderPassCreateInfo{
+		SType:           vk.StructureTypeRenderPassCreateInfo,
+		AttachmentCount: 1,
+		PAttachments:    attachmentDescriptions,
+		SubpassCount:    1,
+		PSubpasses:      subpassDescriptions,
+		DependencyCount: 1,
+		PDependencies:   subpassDependencies,
+	}
+	renderInfo := &VulkanRenderInfo{}
+	err := vk.Error(vk.CreateRenderPass(r.device, &renderPassCreateInfo, nil, &renderInfo.renderPass))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateRenderPass failed with %s", err)
+		return nil, err
+	}
+	return renderInfo, nil
+}
+
+type sliceHeader struct {
+	Data uintptr
+	Len  int
+	Cap  int
+}
+
+func (r *Renderer_VK) CreateSpriteProgram() (*VulkanProgramInfo, error) {
+	program := &VulkanProgramInfo{}
+	var uniformBufferMemory vk.DeviceMemory
+	var err error
+	minAlignment := r.minUniformBufferOffsetAlignment
+	uniformSize := uint32(Max(int(unsafe.Sizeof(VulkanSpriteProgramVertUniformBufferObject{})), int(unsafe.Sizeof(VulkanSpriteProgramFragUniformBufferObject{}))))
+	if uniformSize < minAlignment {
+		uniformSize = minAlignment
+	} else if uniformSize > minAlignment && minAlignment > 0 && uniformSize%minAlignment != 0 {
+		uniformSize = (uniformSize/minAlignment + 1) * minAlignment
+	}
+	program.uniformBuffers = make([]VulkanBuffer, 1)
+	program.uniformBuffers[0].size = uintptr(10000 * uniformSize)
+	program.uniformSize = uniformSize
+	program.uniformBuffers[0].buffer, err = r.CreateBuffer(vk.DeviceSize(program.uniformBuffers[0].size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageUniformBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &uniformBufferMemory)
+	if err != nil {
+		panic(err)
+	}
+	program.uniformBuffers[0].bufferMemory = uniformBufferMemory
+	var uniformData unsafe.Pointer
+	vk.MapMemory(r.device, program.uniformBuffers[0].bufferMemory, 0, vk.DeviceSize(program.uniformBuffers[0].size), 0, &uniformData)
+	program.uniformBuffers[0].data = uniformData
+
+	VertShader, err := staticFiles.ReadFile("shaders/sprite.vert.spv")
+	if err != nil {
+		return nil, err
+	}
+	VertShader2 := make([]uint32, len(VertShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&VertShader2)).Data), VertShader)
+	vertShader, err := r.CreateShader(r.device, VertShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, vertShader, nil)
+
+	FragShader, err := staticFiles.ReadFile("shaders/sprite.frag.spv")
+	if err != nil {
+		return nil, err
+	}
+	FragShader2 := make([]uint32, len(FragShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&FragShader2)).Data), FragShader)
+	fragShader, err := r.CreateShader(r.device, FragShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, fragShader, nil)
+	shaderStages := []vk.PipelineShaderStageCreateInfo{
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageVertexBit,
+			Module: vertShader,
+			PName:  "main\x00",
+		},
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageFragmentBit,
+			Module: fragShader,
+			PName:  "main\x00",
+		},
+	}
+
+	samplerLayoutBinding := []vk.DescriptorSetLayoutBinding{
+		{
+			Binding:            0,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeUniformBuffer,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit),
+		},
+		{
+			Binding:            1,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeUniformBuffer,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		{
+			Binding:            2,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		{
+			Binding:            3,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+	}
+
+	layoutInfo := vk.DescriptorSetLayoutCreateInfo{
+		SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
+		BindingCount: 4,
+		PBindings:    samplerLayoutBinding,
+	}
+	if r.hasPushDescriptors {
+		layoutInfo.Flags = vk.DescriptorSetLayoutCreateFlags(vk.DescriptorSetLayoutCreatePushDescriptorBit)
+	}
+	var descriptorSetLayout vk.DescriptorSetLayout
+	vk.CreateDescriptorSetLayout(r.device, &layoutInfo, nil, &descriptorSetLayout)
+	program.descriptorSetLayouts = append(program.descriptorSetLayouts, descriptorSetLayout)
+	//program.descriptorSetCache, err = v.NewDescriptorSetCache(5000, descriptorSetLayout)
+	if err != nil {
+		err = fmt.Errorf("vk.CreateDescriptorSetLayout failed with %s", err)
+		return nil, err
+	}
+	pushConstantRanges := []vk.PushConstantRange{
+		// palUV
+		{
+			StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+			Offset:     0,
+			Size:       16,
+		},
+	}
+	pipelineLayoutCreateInfo := vk.PipelineLayoutCreateInfo{
+		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount:         1,
+		PSetLayouts:            []vk.DescriptorSetLayout{descriptorSetLayout},
+		PushConstantRangeCount: uint32(len(pushConstantRanges)),
+		PPushConstantRanges:    pushConstantRanges,
+	}
+	var pipelineLayout vk.PipelineLayout
+	vk.CreatePipelineLayout(r.device, &pipelineLayoutCreateInfo, nil, &pipelineLayout)
+	program.pipelineLayout = pipelineLayout
+	dynamicStates := []vk.DynamicState{
+		vk.DynamicStateViewport,
+		vk.DynamicStateScissor,
+	}
+	viewportState := vk.PipelineViewportStateCreateInfo{
+		SType:         vk.StructureTypePipelineViewportStateCreateInfo,
+		ViewportCount: 1,
+		ScissorCount:  1,
+	}
+	dynamicState := vk.PipelineDynamicStateCreateInfo{
+		SType:             vk.StructureTypePipelineDynamicStateCreateInfo,
+		DynamicStateCount: uint32(len(dynamicStates)),
+		PDynamicStates:    dynamicStates,
+	}
+	var primitiveRestartEnable vk.Bool32 = vk.False
+	if runtime.GOOS == "ios" {
+		primitiveRestartEnable = vk.True
+	}
+	inputAssemblyState := vk.PipelineInputAssemblyStateCreateInfo{
+		SType:                  vk.StructureTypePipelineInputAssemblyStateCreateInfo,
+		Topology:               vk.PrimitiveTopologyTriangleStrip,
+		PrimitiveRestartEnable: primitiveRestartEnable,
+	}
+	vertexInputBindings := []vk.VertexInputBindingDescription{{
+		Binding:   0,
+		Stride:    4 * 4, // 4 = sizeof(float32)
+		InputRate: vk.VertexInputRateVertex,
+	}}
+	vertexInputAttributes := []vk.VertexInputAttributeDescription{{
+		Binding:  0,
+		Location: 0,
+		Format:   vk.FormatR32g32Sfloat,
+		Offset:   0,
+	}, {
+		Binding:  0,
+		Location: 1,
+		Format:   vk.FormatR32g32Sfloat,
+		Offset:   8,
+	}}
+	vertexInputState := vk.PipelineVertexInputStateCreateInfo{
+		SType:                           vk.StructureTypePipelineVertexInputStateCreateInfo,
+		VertexBindingDescriptionCount:   uint32(len(vertexInputBindings)),
+		PVertexBindingDescriptions:      vertexInputBindings,
+		VertexAttributeDescriptionCount: uint32(len(vertexInputAttributes)),
+		PVertexAttributeDescriptions:    vertexInputAttributes,
+	}
+	sampleMask := []vk.SampleMask{vk.SampleMask(vk.MaxUint32)}
+	msaa := sys.msaa
+	if msaa <= 0 {
+		msaa = 1
+	}
+	multisampleState := vk.PipelineMultisampleStateCreateInfo{
+		SType:                 vk.StructureTypePipelineMultisampleStateCreateInfo,
+		RasterizationSamples:  vk.SampleCountFlagBits(msaa),
+		SampleShadingEnable:   vk.False,
+		PSampleMask:           sampleMask,
+		MinSampleShading:      1,
+		AlphaToCoverageEnable: 0,
+		AlphaToOneEnable:      0,
+	}
+	rasterState := vk.PipelineRasterizationStateCreateInfo{
+		SType:                   vk.StructureTypePipelineRasterizationStateCreateInfo,
+		DepthClampEnable:        vk.False,
+		RasterizerDiscardEnable: vk.False,
+		PolygonMode:             vk.PolygonModeFill,
+		CullMode:                vk.CullModeFlags(vk.CullModeNone),
+		FrontFace:               vk.FrontFaceClockwise,
+		DepthBiasEnable:         vk.False,
+		DepthBiasConstantFactor: 0,
+		DepthBiasClamp:          0,
+		DepthBiasSlopeFactor:    0,
+		LineWidth:               1,
+	}
+	depthStencilState := vk.PipelineDepthStencilStateCreateInfo{
+		SType:             vk.StructureTypePipelineDepthStencilStateCreateInfo,
+		DepthTestEnable:   vk.False,
+		DepthWriteEnable:  vk.False,
+		StencilTestEnable: vk.False,
+	}
+	blendFunctions := []struct {
+		op  vk.BlendOp
+		src vk.BlendFactor
+		dst vk.BlendFactor
+	}{
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorZero,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorZero,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorZero,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorZero,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorZero,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorZero,
+		},
+	}
+	attachmentStates := make([]vk.PipelineColorBlendAttachmentState, 0, len(blendFunctions))
+	colorBlendStates := make([]vk.PipelineColorBlendStateCreateInfo, 0, len(blendFunctions))
+	pipelineCreateInfos := make([]vk.GraphicsPipelineCreateInfo, 0, len(blendFunctions))
+	pipelineIndexMap := map[interface{}]int{}
+	MapBlendEquation := func(i vk.BlendOp) BlendEquation {
+		var BlendEquationLUT = map[vk.BlendOp]BlendEquation{
+			vk.BlendOpAdd:             BlendAdd,
+			vk.BlendOpReverseSubtract: BlendReverseSubtract,
+		}
+		return BlendEquationLUT[i]
+	}
+
+	MapBlendFactor := func(i vk.BlendFactor) BlendFunc {
+		var MapBlendFactor = map[vk.BlendFactor]BlendFunc{
+			vk.BlendFactorOne:              BlendOne,
+			vk.BlendFactorZero:             BlendZero,
+			vk.BlendFactorSrcAlpha:         BlendSrcAlpha,
+			vk.BlendFactorOneMinusSrcAlpha: BlendOneMinusSrcAlpha,
+			vk.BlendFactorOneMinusDstColor: BlendOneMinusDstColor,
+			vk.BlendFactorDstColor:         BlendDstColor,
+		}
+		return MapBlendFactor[i]
+	}
+	for i := range blendFunctions {
+		attachmentStates = append(attachmentStates, vk.PipelineColorBlendAttachmentState{
+			ColorWriteMask: vk.ColorComponentFlags(
+				vk.ColorComponentRBit | vk.ColorComponentGBit |
+					vk.ColorComponentBBit | vk.ColorComponentABit,
+			),
+			BlendEnable:         vk.True,
+			SrcColorBlendFactor: blendFunctions[i].src,
+			DstColorBlendFactor: blendFunctions[i].dst,
+			ColorBlendOp:        blendFunctions[i].op,
+			SrcAlphaBlendFactor: vk.BlendFactorOne,
+			DstAlphaBlendFactor: vk.BlendFactorZero,
+			AlphaBlendOp:        vk.BlendOpAdd,
+		})
+		colorBlendStates = append(colorBlendStates, vk.PipelineColorBlendStateCreateInfo{
+			SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
+			LogicOpEnable:   vk.False,
+			LogicOp:         vk.LogicOpCopy,
+			AttachmentCount: 1,
+			PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentStates[i]},
+		})
+		pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
+			SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+			StageCount:          2, // vert + frag
+			PStages:             shaderStages,
+			PVertexInputState:   &vertexInputState,
+			PInputAssemblyState: &inputAssemblyState,
+			PViewportState:      &viewportState,
+			PRasterizationState: &rasterState,
+			PMultisampleState:   &multisampleState,
+			PColorBlendState:    &colorBlendStates[i],
+			PDynamicState:       &dynamicState,
+			Layout:              program.pipelineLayout,
+			RenderPass:          r.mainRenderPass.renderPass,
+			PDepthStencilState:  &depthStencilState,
+		})
+		pipelineIndexMap[VulkanBlendState{
+			op:  MapBlendEquation(blendFunctions[i].op),
+			src: MapBlendFactor(blendFunctions[i].src),
+			dst: MapBlendFactor(blendFunctions[i].dst),
+		}] = i
+	}
+	pipelines := make([]vk.Pipeline, len(pipelineCreateInfos))
+	err = vk.Error(vk.CreateGraphicsPipelines(r.device,
+		r.pipelineCache, uint32(len(pipelineCreateInfos)), pipelineCreateInfos, nil, pipelines))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateGraphicsPipelines failed with %s", err)
+		return nil, err
+	}
+	program.pipelines = pipelines
+	program.pipelineIndexMap = pipelineIndexMap
+	return program, nil
+}
+
+func (r *Renderer_VK) CreateShadowMapProgram() (*VulkanProgramInfo, error) {
+	program := &VulkanProgramInfo{}
+	var uniformBufferMemory vk.DeviceMemory
+	var err error
+	uniformSize := r.AlignUniformSize(uint32(Max(VulkanShadowMapUniform1Size, VulkanShadowMapUniform2Size)))
+	program.uniformBuffers = make([]VulkanBuffer, 1)
+	program.uniformBuffers[0].size = uintptr(2000 * uniformSize)
+	program.uniformSize = uniformSize
+	program.uniformBuffers[0].buffer, err = r.CreateBuffer(vk.DeviceSize(program.uniformBuffers[0].size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageUniformBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &uniformBufferMemory)
+	if err != nil {
+		panic(err)
+	}
+	program.uniformBuffers[0].bufferMemory = uniformBufferMemory
+	var uniformData unsafe.Pointer
+	vk.MapMemory(r.device, program.uniformBuffers[0].bufferMemory, 0, vk.DeviceSize(program.uniformBuffers[0].size), 0, &uniformData)
+	program.uniformBuffers[0].data = uniformData
+
+	VertShader, err := staticFiles.ReadFile("shaders/shadow.vert.spv")
+	if err != nil {
+		return nil, err
+	}
+	VertShader2 := make([]uint32, len(VertShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&VertShader2)).Data), VertShader)
+	vertShader, err := r.CreateShader(r.device, VertShader2)
+	if err != nil {
+		return nil, err
+	}
+
+	FragShader, err := staticFiles.ReadFile("shaders/shadow.frag.spv")
+	if err != nil {
+		return nil, err
+	}
+	FragShader2 := make([]uint32, len(FragShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&FragShader2)).Data), FragShader)
+	fragShader, err := r.CreateShader(r.device, FragShader2)
+	if err != nil {
+		return nil, err
+	}
+	program.vertShader = vertShader
+	program.fragShader = fragShader
+	uniformBindings0 := []vk.DescriptorSetLayoutBinding{
+		//VulkanModelProgramUniformBufferObject0
+		{
+			Binding:            0,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeUniformBuffer,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit | vk.ShaderStageFragmentBit),
+		},
+		//VulkanModelProgramUniformBufferObject1
+		{
+			Binding:            1,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeUniformBuffer,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		//VulkanModelProgramUniformBufferObject2
+		{
+			Binding:            2,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeUniformBuffer,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit),
+		},
+		//jointMatrices
+		{
+			Binding:            3,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit),
+		},
+		//morphTargetValues
+		{
+			Binding:            4,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit),
+		},
+		//tex
+		{
+			Binding:            5,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+	}
+	layoutInfo := vk.DescriptorSetLayoutCreateInfo{
+		SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
+		BindingCount: uint32(len(uniformBindings0)),
+		PBindings:    uniformBindings0,
+	}
+	if r.hasPushDescriptors {
+		layoutInfo.Flags = vk.DescriptorSetLayoutCreateFlags(vk.DescriptorSetLayoutCreatePushDescriptorBit)
+	}
+	var descriptorSetLayout vk.DescriptorSetLayout
+	vk.CreateDescriptorSetLayout(r.device, &layoutInfo, nil, &descriptorSetLayout)
+	program.descriptorSetLayouts = append(program.descriptorSetLayouts, descriptorSetLayout)
+	if err != nil {
+		err = fmt.Errorf("vk.CreateDescriptorSetLayout failed with %s", err)
+		return nil, err
+	}
+	pushConstantRanges := []vk.PushConstantRange{
+		// modelMatrix, numVertices
+		{
+			StageFlags: vk.ShaderStageFlags(vk.ShaderStageVertexBit),
+			Offset:     0,
+			Size:       68,
+		},
+	}
+	pipelineLayoutCreateInfo := vk.PipelineLayoutCreateInfo{
+		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount:         1,
+		PSetLayouts:            program.descriptorSetLayouts,
+		PushConstantRangeCount: uint32(len(pushConstantRanges)),
+		PPushConstantRanges:    pushConstantRanges,
+	}
+	var pipelineLayout vk.PipelineLayout
+	vk.CreatePipelineLayout(r.device, &pipelineLayoutCreateInfo, nil, &pipelineLayout)
+	program.pipelines = []vk.Pipeline{}
+	program.pipelineLayout = pipelineLayout
+	program.pipelineIndexMap = map[interface{}]int{}
+	return program, nil
+}
+func (r *Renderer_VK) GetShadowMapPipeline(state *VulkanShadowMapPipelineState) vk.Pipeline {
+	if index, ok := r.shadowMapProgram.pipelineIndexMap[*state]; ok {
+		return r.shadowMapProgram.pipelines[index]
+	}
+	vertSpecializationMapEntries := []vk.SpecializationMapEntry{
+		{
+			ConstantID: 0,
+			Size:       4,
+			Offset:     0,
+		},
+		{
+			ConstantID: 1,
+			Size:       4,
+			Offset:     4,
+		},
+		{
+			ConstantID: 2,
+			Size:       4,
+			Offset:     8,
+		},
+	}
+	fragSpecializationMapEntries := []vk.SpecializationMapEntry{
+		{
+			ConstantID: 3,
+			Size:       4,
+			Offset:     0,
+		},
+	}
+	vertData := struct {
+		useJoint0    bool
+		_padding0    [3]bool
+		useJoint1    bool
+		_padding1    [3]bool
+		useVertColor bool
+		_padding2    [3]bool
+	}{useJoint0: state.VulkanModelSpecializationConstants0.useJoint0, useJoint1: state.VulkanModelSpecializationConstants0.useJoint1, useVertColor: state.VulkanModelSpecializationConstants0.useVertColor}
+	vertSpecializationInfo := []vk.SpecializationInfo{
+		{
+			DataSize:      uint64(unsafe.Sizeof(state.VulkanModelSpecializationConstants0)),
+			MapEntryCount: uint32(len(vertSpecializationMapEntries)),
+			PMapEntries:   vertSpecializationMapEntries,
+			PData:         unsafe.Pointer(&vertData),
+		},
+	}
+	fragData := struct {
+		useTexture bool
+		_padding0  [3]bool
+	}{useTexture: state.useTexture}
+	fragSpecializationInfo := []vk.SpecializationInfo{
+		{
+			DataSize:      uint64(unsafe.Sizeof(fragData)),
+			MapEntryCount: uint32(len(fragSpecializationMapEntries)),
+			PMapEntries:   fragSpecializationMapEntries,
+			PData:         unsafe.Pointer(&fragData),
+		},
+	}
+	shaderStages := []vk.PipelineShaderStageCreateInfo{
+		{
+			SType:               vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:               vk.ShaderStageVertexBit,
+			Module:              r.shadowMapProgram.vertShader,
+			PSpecializationInfo: vertSpecializationInfo,
+			PName:               "main\x00",
+		},
+		{
+			SType:               vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:               vk.ShaderStageFragmentBit,
+			Module:              r.shadowMapProgram.fragShader,
+			PSpecializationInfo: fragSpecializationInfo,
+			PName:               "main\x00",
+		},
+	}
+	viewports := []vk.Viewport{{
+		MinDepth: 0.0,
+		MaxDepth: 1.0,
+		X:        0,
+		Y:        0,
+		Width:    float32(r.shadowMapTextures.width),
+		Height:   float32(r.shadowMapTextures.height),
+	}}
+	scissors := []vk.Rect2D{{
+		Offset: vk.Offset2D{
+			X: 0,
+			Y: 0,
+		},
+		Extent: vk.Extent2D{
+			Width:  uint32(r.shadowMapTextures.width),
+			Height: uint32(r.shadowMapTextures.height),
+		},
+	}}
+	viewportState := vk.PipelineViewportStateCreateInfo{
+		SType:         vk.StructureTypePipelineViewportStateCreateInfo,
+		ViewportCount: 1,
+		ScissorCount:  1,
+		PViewports:    viewports,
+		PScissors:     scissors,
+	}
+	dynamicState := vk.PipelineDynamicStateCreateInfo{
+		SType: vk.StructureTypePipelineDynamicStateCreateInfo,
+		//DynamicStateCount: uint32(len(dynamicStates)),
+		//PDynamicStates:    dynamicStates,
+		DynamicStateCount: 0,
+	}
+	topology := map[PrimitiveMode]vk.PrimitiveTopology{
+		LINES: vk.PrimitiveTopologyLineList,
+		//LINE_LOOP:      vk.PrimitiveTopologyLineList,
+		LINE_STRIP:     vk.PrimitiveTopologyLineStrip,
+		TRIANGLES:      vk.PrimitiveTopologyTriangleList,
+		TRIANGLE_STRIP: vk.PrimitiveTopologyTriangleStrip,
+		TRIANGLE_FAN:   vk.PrimitiveTopologyTriangleFan,
+	}[state.primitiveMode]
+	var primitiveRestartEnable vk.Bool32 = vk.False
+	if runtime.GOOS == "ios" {
+		primitiveRestartEnable = vk.True
+	}
+	inputAssemblyState := vk.PipelineInputAssemblyStateCreateInfo{
+		SType:                  vk.StructureTypePipelineInputAssemblyStateCreateInfo,
+		Topology:               topology,
+		PrimitiveRestartEnable: primitiveRestartEnable,
+	}
+	vertexInputBindings := []vk.VertexInputBindingDescription{
+		{
+			Binding:   0,
+			Stride:    4 * 1, // 4 = sizeof(float32)
+			InputRate: vk.VertexInputRateVertex,
+		},
+		{
+			Binding:   1,
+			Stride:    4 * 3, // 4 = sizeof(float32)
+			InputRate: vk.VertexInputRateVertex,
+		},
+	}
+	vertexInputAttributes := []vk.VertexInputAttributeDescription{
+		//vertexId
+		{
+			Binding:  0,
+			Location: 0,
+			Format:   vk.FormatR32Sint,
+			Offset:   0,
+		},
+		//position
+		{
+			Binding:  1,
+			Location: 1,
+			Format:   vk.FormatR32g32b32Sfloat,
+			Offset:   0,
+		},
+	}
+	vertexBindingIndex := uint32(2)
+	addVertexAttribute := func(size, location uint32, useAttribute bool) {
+		format := vk.FormatR32g32Sfloat
+		switch size {
+		case 3:
+			format = vk.FormatR32g32b32Sfloat
+			break
+		case 4:
+			format = vk.FormatR32g32b32a32Sfloat
+		}
+		if useAttribute {
+			vertexInputBindings = append(vertexInputBindings, vk.VertexInputBindingDescription{
+				Binding:   vertexBindingIndex,
+				Stride:    4 * size, // 4 = sizeof(float32)
+				InputRate: vk.VertexInputRateVertex,
+			})
+			vertexInputAttributes = append(vertexInputAttributes, vk.VertexInputAttributeDescription{
+				Binding:  vertexBindingIndex,
+				Location: location,
+				Format:   format,
+				Offset:   0,
+			})
+			vertexBindingIndex += 1
+		} else {
+			vertexInputAttributes = append(vertexInputAttributes, vk.VertexInputAttributeDescription{
+				Binding:  0,
+				Location: location,
+				Format:   format,
+				Offset:   0,
+			})
+		}
+	}
+	addVertexAttribute(2, 2, state.useUV)
+	addVertexAttribute(4, 3, state.useVertColor)
+	addVertexAttribute(4, 4, state.useJoint0)
+	addVertexAttribute(4, 5, state.useJoint1)
+	addVertexAttribute(4, 6, state.useJoint0)
+	addVertexAttribute(4, 7, state.useJoint1)
+
+	vertexInputState := vk.PipelineVertexInputStateCreateInfo{
+		SType:                           vk.StructureTypePipelineVertexInputStateCreateInfo,
+		VertexBindingDescriptionCount:   uint32(len(vertexInputBindings)),
+		PVertexBindingDescriptions:      vertexInputBindings,
+		VertexAttributeDescriptionCount: uint32(len(vertexInputAttributes)),
+		PVertexAttributeDescriptions:    vertexInputAttributes,
+	}
+	sampleMask := []vk.SampleMask{vk.SampleMask(vk.MaxUint32)}
+	multisampleState := vk.PipelineMultisampleStateCreateInfo{
+		SType:                 vk.StructureTypePipelineMultisampleStateCreateInfo,
+		RasterizationSamples:  vk.SampleCount1Bit,
+		SampleShadingEnable:   vk.False,
+		PSampleMask:           sampleMask,
+		MinSampleShading:      1,
+		AlphaToCoverageEnable: 0,
+		AlphaToOneEnable:      0,
+	}
+	rasterState := vk.PipelineRasterizationStateCreateInfo{
+		SType:                   vk.StructureTypePipelineRasterizationStateCreateInfo,
+		DepthClampEnable:        vk.False,
+		RasterizerDiscardEnable: vk.False,
+		PolygonMode:             vk.PolygonModeFill,
+		CullMode:                vk.CullModeFlags(vk.CullModeBackBit),
+		//CullMode:                vk.CullModeFlags(vk.CullModeNone),
+		FrontFace:               vk.FrontFaceClockwise,
+		DepthBiasEnable:         vk.False,
+		DepthBiasConstantFactor: 0,
+		DepthBiasClamp:          0,
+		DepthBiasSlopeFactor:    0,
+		LineWidth:               1,
+	}
+	if state.invertFrontFace {
+		rasterState.FrontFace = vk.FrontFaceCounterClockwise
+	}
+	if state.doubleSided {
+		rasterState.CullMode = vk.CullModeFlags(vk.CullModeNone)
+	}
+	depthStencilState := vk.PipelineDepthStencilStateCreateInfo{
+		SType:                 vk.StructureTypePipelineDepthStencilStateCreateInfo,
+		DepthTestEnable:       vk.True,
+		DepthWriteEnable:      vk.True,
+		DepthBoundsTestEnable: vk.False,
+		StencilTestEnable:     vk.False,
+		DepthCompareOp:        vk.CompareOpLess,
+	}
+	MapBlendEquation := func(i BlendEquation) vk.BlendOp {
+		var BlendEquationLUT = map[BlendEquation]vk.BlendOp{
+			BlendAdd:             vk.BlendOpAdd,
+			BlendReverseSubtract: vk.BlendOpReverseSubtract,
+		}
+		return BlendEquationLUT[i]
+	}
+
+	MapBlendFactor := func(i BlendFunc) vk.BlendFactor {
+		var MapBlendFactor = map[BlendFunc]vk.BlendFactor{
+			BlendOne:              vk.BlendFactorOne,
+			BlendZero:             vk.BlendFactorZero,
+			BlendSrcAlpha:         vk.BlendFactorSrcAlpha,
+			BlendOneMinusSrcAlpha: vk.BlendFactorOneMinusSrcAlpha,
+			BlendOneMinusDstColor: vk.BlendFactorOneMinusDstColor,
+			BlendDstColor:         vk.BlendFactorDstColor,
+		}
+		return MapBlendFactor[i]
+	}
+
+	blendFunctions := []struct {
+		op  vk.BlendOp
+		src vk.BlendFactor
+		dst vk.BlendFactor
+	}{
+		{
+			op:  MapBlendEquation(BlendAdd),
+			src: MapBlendFactor(BlendOne),
+			dst: MapBlendFactor(BlendZero),
+		},
+	}
+	attachmentStates := make([]vk.PipelineColorBlendAttachmentState, 0, len(blendFunctions))
+	colorBlendStates := make([]vk.PipelineColorBlendStateCreateInfo, 0, len(blendFunctions))
+	pipelineCreateInfos := make([]vk.GraphicsPipelineCreateInfo, 0, len(blendFunctions))
+	pipelineRenderingCreateInfo := vk.PipelineRenderingCreateInfo{
+		SType:                   vk.StructureTypePipelineRenderingCreateInfo,
+		ColorAttachmentCount:    0,
+		DepthAttachmentFormat:   r.FindSupportedDepthFormat(),
+		StencilAttachmentFormat: vk.FormatUndefined,
+	}
+	cPipelineRenderingCreateInfo, _ := pipelineRenderingCreateInfo.PassRef()
+	defer pipelineRenderingCreateInfo.Free()
+	for i := range blendFunctions {
+		attachmentStates = append(attachmentStates, vk.PipelineColorBlendAttachmentState{
+			ColorWriteMask: vk.ColorComponentFlags(
+				vk.ColorComponentRBit | vk.ColorComponentGBit |
+					vk.ColorComponentBBit | vk.ColorComponentABit,
+			),
+			BlendEnable:         vk.True,
+			SrcColorBlendFactor: blendFunctions[i].src,
+			DstColorBlendFactor: blendFunctions[i].dst,
+			ColorBlendOp:        blendFunctions[i].op,
+			SrcAlphaBlendFactor: vk.BlendFactorOne,
+			DstAlphaBlendFactor: vk.BlendFactorZero,
+			AlphaBlendOp:        vk.BlendOpAdd,
+		})
+		colorBlendStates = append(colorBlendStates, vk.PipelineColorBlendStateCreateInfo{
+			SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
+			LogicOpEnable:   vk.False,
+			LogicOp:         vk.LogicOpCopy,
+			AttachmentCount: 1,
+			PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentStates[i]},
+		})
+		pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
+			SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+			StageCount:          2, // vert + frag
+			PStages:             shaderStages,
+			PVertexInputState:   &vertexInputState,
+			PInputAssemblyState: &inputAssemblyState,
+			PViewportState:      &viewportState,
+			PRasterizationState: &rasterState,
+			PMultisampleState:   &multisampleState,
+			PColorBlendState:    &colorBlendStates[i],
+			PDynamicState:       &dynamicState,
+			Layout:              r.shadowMapProgram.pipelineLayout,
+			PDepthStencilState:  &depthStencilState,
+			RenderPass:          nil,
+			PNext:               unsafe.Pointer(cPipelineRenderingCreateInfo),
+		})
+	}
+	pipelines := make([]vk.Pipeline, len(pipelineCreateInfos))
+	err := vk.Error(vk.CreateGraphicsPipelines(r.device,
+		r.pipelineCache, uint32(len(pipelineCreateInfos)), pipelineCreateInfos, nil, pipelines))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateGraphicsPipelines failed with %s", err)
+	}
+	r.shadowMapProgram.pipelineIndexMap[*state] = len(r.shadowMapProgram.pipelines)
+	r.shadowMapProgram.pipelines = append(r.shadowMapProgram.pipelines, pipelines...)
+	return pipelines[0]
+}
+
+func (r *Renderer_VK) CreateModelProgram() (*VulkanProgramInfo, error) {
+	program := &VulkanProgramInfo{}
+	var uniformBufferMemory vk.DeviceMemory
+	var err error
+	minAlignment := r.minUniformBufferOffsetAlignment
+	uniformSize := uint32(Max(VulkanModelUniform0Size, Max(VulkanModelUniform1Size, VulkanModelUniform2Size)))
+	if uniformSize < minAlignment {
+		uniformSize = minAlignment
+	} else if uniformSize > minAlignment && minAlignment > 0 && uniformSize%minAlignment != 0 {
+		uniformSize = (uniformSize/minAlignment + 1) * minAlignment
+	}
+	program.uniformBuffers = make([]VulkanBuffer, 1)
+	program.uniformBuffers[0].size = uintptr(2000 * uniformSize)
+	program.uniformSize = uniformSize
+	program.uniformBuffers[0].buffer, err = r.CreateBuffer(vk.DeviceSize(program.uniformBuffers[0].size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageUniformBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &uniformBufferMemory)
+	if err != nil {
+		panic(err)
+	}
+	program.uniformBuffers[0].bufferMemory = uniformBufferMemory
+	var uniformData unsafe.Pointer
+	vk.MapMemory(r.device, program.uniformBuffers[0].bufferMemory, 0, vk.DeviceSize(program.uniformBuffers[0].size), 0, &uniformData)
+	program.uniformBuffers[0].data = uniformData
+
+	VertShader, err := staticFiles.ReadFile("shaders/model.vert.spv")
+	if err != nil {
+		return nil, err
+	}
+	VertShader2 := make([]uint32, len(VertShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&VertShader2)).Data), VertShader)
+	vertShader, err := r.CreateShader(r.device, VertShader2)
+	if err != nil {
+		return nil, err
+	}
+	//defer vk.DestroyShaderModule(r.device, vertShader, nil)
+
+	FragShader, err := staticFiles.ReadFile("shaders/model.frag.spv")
+	if err != nil {
+		return nil, err
+	}
+	FragShader2 := make([]uint32, len(FragShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&FragShader2)).Data), FragShader)
+	fragShader, err := r.CreateShader(r.device, FragShader2)
+	if err != nil {
+		return nil, err
+	}
+	program.vertShader = vertShader
+	program.fragShader = fragShader
+	//defer vk.DestroyShaderModule(r.device, fragShader, nil)
+	uniformBindings0 := []vk.DescriptorSetLayoutBinding{
+		//VulkanModelProgramUniformBufferObject0
+		{
+			Binding:            0,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeUniformBuffer,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit | vk.ShaderStageFragmentBit),
+		},
+		//VulkanModelProgramUniformBufferObject1
+		{
+			Binding:            1,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeUniformBuffer,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		//VulkanModelProgramUniformBufferObject2
+		{
+			Binding:            2,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeUniformBuffer,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit | vk.ShaderStageFragmentBit),
+		},
+		//jointMatrices
+		{
+			Binding:            3,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit),
+		},
+		//morphTargetValues
+		{
+			Binding:            4,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit),
+		},
+		//lambertianEnvSampler
+		{
+			Binding:            5,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		//GGXEnvSampler
+		{
+			Binding:            6,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		//GGXLUT
+		{
+			Binding:            7,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		//tex
+		{
+			Binding:            8,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		//normalMap
+		{
+			Binding:            9,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		//metallicRoughnessMap
+		{
+			Binding:            10,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		//ambientOcclusionMap
+		{
+			Binding:            11,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		//emissionMap
+		{
+			Binding:            12,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+		//shadowCubeMap
+		{
+			Binding:            13,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+	}
+	layoutInfo := vk.DescriptorSetLayoutCreateInfo{
+		SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
+		BindingCount: uint32(len(uniformBindings0)),
+		PBindings:    uniformBindings0,
+	}
+	if r.hasPushDescriptors {
+		layoutInfo.Flags = vk.DescriptorSetLayoutCreateFlags(vk.DescriptorSetLayoutCreatePushDescriptorBit)
+	}
+	var descriptorSetLayout vk.DescriptorSetLayout
+	vk.CreateDescriptorSetLayout(r.device, &layoutInfo, nil, &descriptorSetLayout)
+	program.descriptorSetLayouts = append(program.descriptorSetLayouts, descriptorSetLayout)
+	if err != nil {
+		err = fmt.Errorf("vk.CreateDescriptorSetLayout failed with %s", err)
+		return nil, err
+	}
+	pipelineLayoutCreateInfo := vk.PipelineLayoutCreateInfo{
+		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount:         1,
+		PSetLayouts:            program.descriptorSetLayouts,
+		PushConstantRangeCount: 0,
+		PPushConstantRanges:    nil,
+	}
+	var pipelineLayout vk.PipelineLayout
+	vk.CreatePipelineLayout(r.device, &pipelineLayoutCreateInfo, nil, &pipelineLayout)
+	program.pipelines = []vk.Pipeline{}
+	program.pipelineLayout = pipelineLayout
+	program.pipelineIndexMap = map[interface{}]int{}
+	return program, nil
+}
+func (r *Renderer_VK) GetModelPipeline(state *VulkanPipelineState) vk.Pipeline {
+	if index, ok := r.modelProgram.pipelineIndexMap[*state]; ok {
+		return r.modelProgram.pipelines[index]
+	}
+	vertSpecializationMapEntries := []vk.SpecializationMapEntry{
+		{
+			ConstantID: 0,
+			Size:       4,
+			Offset:     0,
+		},
+		{
+			ConstantID: 1,
+			Size:       4,
+			Offset:     4,
+		},
+		{
+			ConstantID: 2,
+			Size:       4,
+			Offset:     8,
+		},
+		{
+			ConstantID: 3,
+			Size:       4,
+			Offset:     12,
+		},
+		{
+			ConstantID: 4,
+			Size:       4,
+			Offset:     16,
+		},
+		{
+			ConstantID: 5,
+			Size:       4,
+			Offset:     20,
+		},
+	}
+	fragSpecializationMapEntries := []vk.SpecializationMapEntry{
+		{
+			ConstantID: 6,
+			Size:       4,
+			Offset:     0,
+		},
+		{
+			ConstantID: 7,
+			Size:       4,
+			Offset:     4,
+		},
+		{
+			ConstantID: 8,
+			Size:       4,
+			Offset:     8,
+		},
+		{
+			ConstantID: 9,
+			Size:       4,
+			Offset:     12,
+		},
+		{
+			ConstantID: 10,
+			Size:       4,
+			Offset:     16,
+		},
+	}
+	vertSpecializationInfo := []vk.SpecializationInfo{
+		{
+			DataSize:      uint64(unsafe.Sizeof(state.VulkanModelPipelineState.VulkanModelSpecializationConstants0)),
+			MapEntryCount: uint32(len(vertSpecializationMapEntries)),
+			PMapEntries:   vertSpecializationMapEntries,
+			PData:         unsafe.Pointer(&state.VulkanModelPipelineState.VulkanModelSpecializationConstants0),
+		},
+	}
+	fragSpecializationInfo := []vk.SpecializationInfo{
+		{
+			DataSize:      uint64(unsafe.Sizeof(state.VulkanModelPipelineState.VulkanModelSpecializationConstants1)),
+			MapEntryCount: uint32(len(fragSpecializationMapEntries)),
+			PMapEntries:   fragSpecializationMapEntries,
+			PData:         unsafe.Pointer(&state.VulkanModelPipelineState.VulkanModelSpecializationConstants1),
+		},
+	}
+	shaderStages := []vk.PipelineShaderStageCreateInfo{
+		{
+			SType:               vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:               vk.ShaderStageVertexBit,
+			Module:              r.modelProgram.vertShader,
+			PSpecializationInfo: vertSpecializationInfo,
+			PName:               "main\x00",
+		},
+		{
+			SType:               vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:               vk.ShaderStageFragmentBit,
+			Module:              r.modelProgram.fragShader,
+			PSpecializationInfo: fragSpecializationInfo,
+			PName:               "main\x00",
+		},
+	}
+	dynamicStates := []vk.DynamicState{
+		vk.DynamicStateViewport,
+		vk.DynamicStateScissor,
+	}
+	viewportState := vk.PipelineViewportStateCreateInfo{
+		SType:         vk.StructureTypePipelineViewportStateCreateInfo,
+		ViewportCount: 1,
+		ScissorCount:  1,
+	}
+	dynamicState := vk.PipelineDynamicStateCreateInfo{
+		SType:             vk.StructureTypePipelineDynamicStateCreateInfo,
+		DynamicStateCount: uint32(len(dynamicStates)),
+		PDynamicStates:    dynamicStates,
+	}
+	topology := map[PrimitiveMode]vk.PrimitiveTopology{
+		LINES: vk.PrimitiveTopologyLineList,
+		//LINE_LOOP:      vk.PrimitiveTopologyLineList,
+		LINE_STRIP:     vk.PrimitiveTopologyLineStrip,
+		TRIANGLES:      vk.PrimitiveTopologyTriangleList,
+		TRIANGLE_STRIP: vk.PrimitiveTopologyTriangleStrip,
+		TRIANGLE_FAN:   vk.PrimitiveTopologyTriangleFan,
+	}[state.VulkanModelPipelineState.primitiveMode]
+	var primitiveRestartEnable vk.Bool32 = vk.False
+	if runtime.GOOS == "ios" {
+		primitiveRestartEnable = vk.True
+	}
+	inputAssemblyState := vk.PipelineInputAssemblyStateCreateInfo{
+		SType:                  vk.StructureTypePipelineInputAssemblyStateCreateInfo,
+		Topology:               topology,
+		PrimitiveRestartEnable: primitiveRestartEnable,
+	}
+	vertexInputBindings := []vk.VertexInputBindingDescription{
+		{
+			Binding:   0,
+			Stride:    4 * 1, // 4 = sizeof(float32)
+			InputRate: vk.VertexInputRateVertex,
+		},
+		{
+			Binding:   1,
+			Stride:    4 * 3, // 4 = sizeof(float32)
+			InputRate: vk.VertexInputRateVertex,
+		},
+	}
+	vertexInputAttributes := []vk.VertexInputAttributeDescription{
+		//vertexId
+		{
+			Binding:  0,
+			Location: 0,
+			Format:   vk.FormatR32Sint,
+			Offset:   0,
+		},
+		//position
+		{
+			Binding:  1,
+			Location: 1,
+			Format:   vk.FormatR32g32b32Sfloat,
+			Offset:   0,
+		},
+	}
+	vertexBindingIndex := uint32(2)
+	addVertexAttribute := func(size, location uint32, useAttribute bool) {
+		format := vk.FormatR32g32Sfloat
+		switch size {
+		case 3:
+			format = vk.FormatR32g32b32Sfloat
+			break
+		case 4:
+			format = vk.FormatR32g32b32a32Sfloat
+		}
+		if useAttribute {
+			vertexInputBindings = append(vertexInputBindings, vk.VertexInputBindingDescription{
+				Binding:   vertexBindingIndex,
+				Stride:    4 * size, // 4 = sizeof(float32)
+				InputRate: vk.VertexInputRateVertex,
+			})
+			vertexInputAttributes = append(vertexInputAttributes, vk.VertexInputAttributeDescription{
+				Binding:  vertexBindingIndex,
+				Location: location,
+				Format:   format,
+				Offset:   0,
+			})
+			vertexBindingIndex += 1
+		} else {
+			vertexInputAttributes = append(vertexInputAttributes, vk.VertexInputAttributeDescription{
+				Binding:  0,
+				Location: location,
+				Format:   format,
+				Offset:   0,
+			})
+		}
+	}
+	addVertexAttribute(2, 2, state.useUV)
+	addVertexAttribute(3, 3, state.useNormal)
+	addVertexAttribute(4, 4, state.useTangent)
+	addVertexAttribute(4, 5, state.useVertColor)
+	addVertexAttribute(4, 6, state.useJoint0)
+	addVertexAttribute(4, 7, state.useJoint0)
+	addVertexAttribute(4, 8, state.useJoint1)
+	addVertexAttribute(4, 9, state.useJoint1)
+	addVertexAttribute(4, 10, state.useOutlineAttribute)
+
+	vertexInputState := vk.PipelineVertexInputStateCreateInfo{
+		SType:                           vk.StructureTypePipelineVertexInputStateCreateInfo,
+		VertexBindingDescriptionCount:   uint32(len(vertexInputBindings)),
+		PVertexBindingDescriptions:      vertexInputBindings,
+		VertexAttributeDescriptionCount: uint32(len(vertexInputAttributes)),
+		PVertexAttributeDescriptions:    vertexInputAttributes,
+	}
+	sampleMask := []vk.SampleMask{vk.SampleMask(vk.MaxUint32)}
+	msaa := sys.msaa
+	if msaa <= 0 {
+		msaa = 1
+	}
+	multisampleState := vk.PipelineMultisampleStateCreateInfo{
+		SType:                 vk.StructureTypePipelineMultisampleStateCreateInfo,
+		RasterizationSamples:  vk.SampleCountFlagBits(msaa),
+		SampleShadingEnable:   vk.False,
+		PSampleMask:           sampleMask,
+		MinSampleShading:      1,
+		AlphaToCoverageEnable: 0,
+		AlphaToOneEnable:      0,
+	}
+	rasterState := vk.PipelineRasterizationStateCreateInfo{
+		SType:                   vk.StructureTypePipelineRasterizationStateCreateInfo,
+		DepthClampEnable:        vk.False,
+		RasterizerDiscardEnable: vk.False,
+		PolygonMode:             vk.PolygonModeFill,
+		CullMode:                vk.CullModeFlags(vk.CullModeBackBit),
+		//CullMode:                vk.CullModeFlags(vk.CullModeNone),
+		FrontFace:               vk.FrontFaceCounterClockwise,
+		DepthBiasEnable:         vk.False,
+		DepthBiasConstantFactor: 0,
+		DepthBiasClamp:          0,
+		DepthBiasSlopeFactor:    0,
+		LineWidth:               1,
+	}
+	if state.VulkanModelPipelineState.invertFrontFace {
+		rasterState.FrontFace = vk.FrontFaceClockwise
+	}
+	if state.VulkanModelPipelineState.doubleSided {
+		rasterState.CullMode = vk.CullModeFlags(vk.CullModeNone)
+	}
+	depthStencilState := vk.PipelineDepthStencilStateCreateInfo{
+		SType:                 vk.StructureTypePipelineDepthStencilStateCreateInfo,
+		DepthTestEnable:       vk.True,
+		DepthWriteEnable:      vk.True,
+		DepthBoundsTestEnable: vk.False,
+		StencilTestEnable:     vk.False,
+		DepthCompareOp:        vk.CompareOpLess,
+	}
+	if !state.VulkanModelPipelineState.depthTest {
+		depthStencilState.DepthTestEnable = vk.False
+	}
+	if !state.VulkanModelPipelineState.depthMask {
+		depthStencilState.DepthWriteEnable = vk.False
+	}
+	MapBlendEquation := func(i BlendEquation) vk.BlendOp {
+		var BlendEquationLUT = map[BlendEquation]vk.BlendOp{
+			BlendAdd:             vk.BlendOpAdd,
+			BlendReverseSubtract: vk.BlendOpReverseSubtract,
+		}
+		return BlendEquationLUT[i]
+	}
+
+	MapBlendFactor := func(i BlendFunc) vk.BlendFactor {
+		var MapBlendFactor = map[BlendFunc]vk.BlendFactor{
+			BlendOne:              vk.BlendFactorOne,
+			BlendZero:             vk.BlendFactorZero,
+			BlendSrcAlpha:         vk.BlendFactorSrcAlpha,
+			BlendOneMinusSrcAlpha: vk.BlendFactorOneMinusSrcAlpha,
+			BlendOneMinusDstColor: vk.BlendFactorOneMinusDstColor,
+			BlendDstColor:         vk.BlendFactorDstColor,
+		}
+		return MapBlendFactor[i]
+	}
+
+	blendFunctions := []struct {
+		op  vk.BlendOp
+		src vk.BlendFactor
+		dst vk.BlendFactor
+	}{
+		{
+			op:  MapBlendEquation(r.VKState.VulkanBlendState.op),
+			src: MapBlendFactor(r.VKState.VulkanBlendState.src),
+			dst: MapBlendFactor(r.VKState.VulkanBlendState.dst),
+		},
+	}
+	attachmentStates := make([]vk.PipelineColorBlendAttachmentState, 0, len(blendFunctions))
+	colorBlendStates := make([]vk.PipelineColorBlendStateCreateInfo, 0, len(blendFunctions))
+	pipelineCreateInfos := make([]vk.GraphicsPipelineCreateInfo, 0, len(blendFunctions))
+	for i := range blendFunctions {
+		attachmentStates = append(attachmentStates, vk.PipelineColorBlendAttachmentState{
+			ColorWriteMask: vk.ColorComponentFlags(
+				vk.ColorComponentRBit | vk.ColorComponentGBit |
+					vk.ColorComponentBBit | vk.ColorComponentABit,
+			),
+			BlendEnable:         vk.True,
+			SrcColorBlendFactor: blendFunctions[i].src,
+			DstColorBlendFactor: blendFunctions[i].dst,
+			ColorBlendOp:        blendFunctions[i].op,
+			SrcAlphaBlendFactor: vk.BlendFactorOne,
+			DstAlphaBlendFactor: vk.BlendFactorZero,
+			AlphaBlendOp:        vk.BlendOpAdd,
+		})
+		colorBlendStates = append(colorBlendStates, vk.PipelineColorBlendStateCreateInfo{
+			SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
+			LogicOpEnable:   vk.False,
+			LogicOp:         vk.LogicOpCopy,
+			AttachmentCount: 1,
+			PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentStates[i]},
+		})
+		pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
+			SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+			StageCount:          2, // vert + frag
+			PStages:             shaderStages,
+			PVertexInputState:   &vertexInputState,
+			PInputAssemblyState: &inputAssemblyState,
+			PViewportState:      &viewportState,
+			PRasterizationState: &rasterState,
+			PMultisampleState:   &multisampleState,
+			PColorBlendState:    &colorBlendStates[i],
+			PDynamicState:       &dynamicState,
+			Layout:              r.modelProgram.pipelineLayout,
+			RenderPass:          r.mainRenderPass.renderPass,
+			PDepthStencilState:  &depthStencilState,
+		})
+	}
+	pipelines := make([]vk.Pipeline, len(pipelineCreateInfos))
+	err := vk.Error(vk.CreateGraphicsPipelines(r.device,
+		r.pipelineCache, uint32(len(pipelineCreateInfos)), pipelineCreateInfos, nil, pipelines))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateGraphicsPipelines failed with %s", err)
+	}
+	r.modelProgram.pipelineIndexMap[*state] = len(r.modelProgram.pipelines)
+	r.modelProgram.pipelines = append(r.modelProgram.pipelines, pipelines...)
+	return pipelines[0]
+}
+func (r *Renderer_VK) CreateFullScreenShaderProgram(externalShaders [][][]byte) (*VulkanProgramInfo, error) {
+	program := &VulkanProgramInfo{}
+	var err error
+
+	samplerLayoutBinding := []vk.DescriptorSetLayoutBinding{
+		{
+			Binding:            0,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+	}
+	layoutInfo := vk.DescriptorSetLayoutCreateInfo{
+		SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
+		BindingCount: 1,
+		PBindings:    samplerLayoutBinding,
+	}
+	var descriptorSetLayout vk.DescriptorSetLayout
+	vk.CreateDescriptorSetLayout(r.device, &layoutInfo, nil, &descriptorSetLayout)
+	program.descriptorSetLayouts = append(program.descriptorSetLayouts, descriptorSetLayout)
+	if err != nil {
+		err = fmt.Errorf("vk.CreateDescriptorSetLayout failed with %s", err)
+		return nil, err
+	}
+	pushConstantRanges := []vk.PushConstantRange{
+		{
+			StageFlags: vk.ShaderStageFlags(vk.ShaderStageVertexBit | vk.ShaderStageFragmentBit),
+			Offset:     0,
+			Size:       4 * 3,
+		},
+	}
+	pipelineLayoutCreateInfo := vk.PipelineLayoutCreateInfo{
+		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount:         1,
+		PSetLayouts:            []vk.DescriptorSetLayout{descriptorSetLayout},
+		PushConstantRangeCount: 1,
+		PPushConstantRanges:    pushConstantRanges,
+	}
+	var pipelineLayout vk.PipelineLayout
+	vk.CreatePipelineLayout(r.device, &pipelineLayoutCreateInfo, nil, &pipelineLayout)
+	program.pipelineLayout = pipelineLayout
+	dynamicStates := []vk.DynamicState{
+		vk.DynamicStateViewport,
+		vk.DynamicStateScissor,
+	}
+	viewportState := vk.PipelineViewportStateCreateInfo{
+		SType:         vk.StructureTypePipelineViewportStateCreateInfo,
+		ViewportCount: 1,
+		ScissorCount:  1,
+	}
+	dynamicState := vk.PipelineDynamicStateCreateInfo{
+		SType:             vk.StructureTypePipelineDynamicStateCreateInfo,
+		DynamicStateCount: uint32(len(dynamicStates)),
+		PDynamicStates:    dynamicStates,
+	}
+	var primitiveRestartEnable vk.Bool32 = vk.False
+	if runtime.GOOS == "ios" {
+		primitiveRestartEnable = vk.True
+	}
+	inputAssemblyState := vk.PipelineInputAssemblyStateCreateInfo{
+		SType:                  vk.StructureTypePipelineInputAssemblyStateCreateInfo,
+		Topology:               vk.PrimitiveTopologyTriangleStrip,
+		PrimitiveRestartEnable: primitiveRestartEnable,
+	}
+
+	vertexInputBindings := []vk.VertexInputBindingDescription{{
+		Binding:   0,
+		Stride:    2 * 4, // 4 = sizeof(float32)
+		InputRate: vk.VertexInputRateVertex,
+	}}
+	vertexInputAttributes := []vk.VertexInputAttributeDescription{{
+		Binding:  0,
+		Location: 0,
+		Format:   vk.FormatR32g32Sfloat,
+		Offset:   0,
+	}}
+	vertexInputState := vk.PipelineVertexInputStateCreateInfo{
+		SType:                           vk.StructureTypePipelineVertexInputStateCreateInfo,
+		VertexBindingDescriptionCount:   uint32(len(vertexInputBindings)),
+		PVertexBindingDescriptions:      vertexInputBindings,
+		VertexAttributeDescriptionCount: uint32(len(vertexInputAttributes)),
+		PVertexAttributeDescriptions:    vertexInputAttributes,
+	}
+	sampleMask := []vk.SampleMask{vk.SampleMask(vk.MaxUint32)}
+	multisampleState := vk.PipelineMultisampleStateCreateInfo{
+		SType:                 vk.StructureTypePipelineMultisampleStateCreateInfo,
+		RasterizationSamples:  vk.SampleCount1Bit,
+		SampleShadingEnable:   vk.False,
+		PSampleMask:           sampleMask,
+		MinSampleShading:      1,
+		AlphaToCoverageEnable: 0,
+		AlphaToOneEnable:      0,
+	}
+	rasterState := vk.PipelineRasterizationStateCreateInfo{
+		SType:                   vk.StructureTypePipelineRasterizationStateCreateInfo,
+		DepthClampEnable:        vk.False,
+		RasterizerDiscardEnable: vk.False,
+		PolygonMode:             vk.PolygonModeFill,
+		CullMode:                vk.CullModeFlags(vk.CullModeNone),
+		FrontFace:               vk.FrontFaceClockwise,
+		DepthBiasEnable:         vk.False,
+		DepthBiasConstantFactor: 0,
+		DepthBiasClamp:          0,
+		DepthBiasSlopeFactor:    0,
+		LineWidth:               1,
+	}
+	var pipelineCreateInfos []vk.GraphicsPipelineCreateInfo
+	attachmentState := vk.PipelineColorBlendAttachmentState{
+		ColorWriteMask: vk.ColorComponentFlags(
+			vk.ColorComponentRBit | vk.ColorComponentGBit |
+				vk.ColorComponentBBit | vk.ColorComponentABit,
+		),
+		BlendEnable:         vk.True,
+		SrcColorBlendFactor: vk.BlendFactorOne,
+		DstColorBlendFactor: vk.BlendFactorZero,
+		ColorBlendOp:        vk.BlendOpAdd,
+		SrcAlphaBlendFactor: vk.BlendFactorOne,
+		DstAlphaBlendFactor: vk.BlendFactorZero,
+		AlphaBlendOp:        vk.BlendOpAdd,
+	}
+	colorBlendState := vk.PipelineColorBlendStateCreateInfo{
+		SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
+		LogicOpEnable:   vk.False,
+		LogicOp:         vk.LogicOpCopy,
+		AttachmentCount: 1,
+		PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentState},
+	}
+	if len(externalShaders) == 0 {
+		pipelineCreateInfos = make([]vk.GraphicsPipelineCreateInfo, 0, 1)
+	} else {
+		pipelineCreateInfos = make([]vk.GraphicsPipelineCreateInfo, 0, len(externalShaders[0])+1)
+		for i := range externalShaders[0] {
+			VertShader2 := make([]uint32, len(externalShaders[0][i])/4)
+			vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&VertShader2)).Data), externalShaders[0][i])
+			vertShader, err := r.CreateShader(r.device, VertShader2)
+			if err != nil {
+				return nil, err
+			}
+			defer vk.DestroyShaderModule(r.device, vertShader, nil)
+
+			FragShader2 := make([]uint32, len(externalShaders[1][i])/4)
+			vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&FragShader2)).Data), externalShaders[1][i])
+			fragShader, err := r.CreateShader(r.device, FragShader2)
+			if err != nil {
+				return nil, err
+			}
+			defer vk.DestroyShaderModule(r.device, fragShader, nil)
+			shaderStages := []vk.PipelineShaderStageCreateInfo{
+				{
+					SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+					Stage:  vk.ShaderStageVertexBit,
+					Module: vertShader,
+					PName:  "main\x00",
+				},
+				{
+					SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+					Stage:  vk.ShaderStageFragmentBit,
+					Module: fragShader,
+					PName:  "main\x00",
+				},
+			}
+			pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
+				SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+				StageCount:          2, // vert + frag
+				PStages:             shaderStages,
+				PVertexInputState:   &vertexInputState,
+				PInputAssemblyState: &inputAssemblyState,
+				PViewportState:      &viewportState,
+				PRasterizationState: &rasterState,
+				PMultisampleState:   &multisampleState,
+				PColorBlendState:    &colorBlendState,
+				PDynamicState:       &dynamicState,
+				Layout:              program.pipelineLayout,
+				RenderPass:          r.swapchainRenderPass.renderPass,
+				PDepthStencilState:  nil,
+			})
+		}
+	}
+	VertShader, err := staticFiles.ReadFile("shaders/ident.vert.spv")
+	if err != nil {
+		return nil, err
+	}
+	VertShader2 := make([]uint32, len(VertShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&VertShader2)).Data), VertShader)
+	vertShader, err := r.CreateShader(r.device, VertShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, vertShader, nil)
+
+	FragShader, err := staticFiles.ReadFile("shaders/ident.frag.spv")
+	if err != nil {
+		return nil, err
+	}
+	FragShader2 := make([]uint32, len(FragShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&FragShader2)).Data), FragShader)
+	fragShader, err := r.CreateShader(r.device, FragShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, fragShader, nil)
+
+	shaderStages := []vk.PipelineShaderStageCreateInfo{
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageVertexBit,
+			Module: vertShader,
+			PName:  "main\x00",
+		},
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageFragmentBit,
+			Module: fragShader,
+			PName:  "main\x00",
+		},
+	}
+	pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
+		SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+		StageCount:          2, // vert + frag
+		PStages:             shaderStages,
+		PVertexInputState:   &vertexInputState,
+		PInputAssemblyState: &inputAssemblyState,
+		PViewportState:      &viewportState,
+		PRasterizationState: &rasterState,
+		PMultisampleState:   &multisampleState,
+		PColorBlendState:    &colorBlendState,
+		PDynamicState:       &dynamicState,
+		Layout:              program.pipelineLayout,
+		RenderPass:          r.swapchainRenderPass.renderPass,
+		PDepthStencilState:  nil,
+	})
+	pipelines := make([]vk.Pipeline, len(pipelineCreateInfos))
+	err = vk.Error(vk.CreateGraphicsPipelines(r.device,
+		r.pipelineCache, uint32(len(pipelineCreateInfos)), pipelineCreateInfos, nil, pipelines))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateGraphicsPipelines failed with %s", err)
+		return nil, err
+	}
+	program.pipelines = pipelines
+	return program, nil
+}
+
+func (r *Renderer_VK) CreatePanoramaToCubeMapProgram() (*VulkanProgramInfo, error) {
+	program := &VulkanProgramInfo{}
+	var err error
+	VertShader, err := staticFiles.ReadFile("shaders/ident.vert.spv")
+	if err != nil {
+		return nil, err
+	}
+	VertShader2 := make([]uint32, len(VertShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&VertShader2)).Data), VertShader)
+	vertShader, err := r.CreateShader(r.device, VertShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, vertShader, nil)
+
+	FragShader, err := staticFiles.ReadFile("shaders/panoramaToCubeMap.frag.spv")
+	if err != nil {
+		return nil, err
+	}
+	FragShader2 := make([]uint32, len(FragShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&FragShader2)).Data), FragShader)
+	fragShader, err := r.CreateShader(r.device, FragShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, fragShader, nil)
+	shaderStages := []vk.PipelineShaderStageCreateInfo{
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageVertexBit,
+			Module: vertShader,
+			PName:  "main\x00",
+		},
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageFragmentBit,
+			Module: fragShader,
+			PName:  "main\x00",
+		},
+	}
+
+	samplerLayoutBinding := []vk.DescriptorSetLayoutBinding{
+		{
+			Binding:            0,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+	}
+	layoutInfo := vk.DescriptorSetLayoutCreateInfo{
+		SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
+		BindingCount: 1,
+		PBindings:    samplerLayoutBinding,
+	}
+	if r.hasPushDescriptors {
+		layoutInfo.Flags = vk.DescriptorSetLayoutCreateFlags(vk.DescriptorSetLayoutCreatePushDescriptorBit)
+	}
+	var descriptorSetLayout vk.DescriptorSetLayout
+	vk.CreateDescriptorSetLayout(r.device, &layoutInfo, nil, &descriptorSetLayout)
+	program.descriptorSetLayouts = append(program.descriptorSetLayouts, descriptorSetLayout)
+	if err != nil {
+		err = fmt.Errorf("vk.CreateDescriptorSetLayout failed with %s", err)
+		return nil, err
+	}
+	pipelineLayoutCreateInfo := vk.PipelineLayoutCreateInfo{
+		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount:         1,
+		PSetLayouts:            []vk.DescriptorSetLayout{descriptorSetLayout},
+		PushConstantRangeCount: 0,
+		PPushConstantRanges:    nil,
+	}
+	var pipelineLayout vk.PipelineLayout
+	vk.CreatePipelineLayout(r.device, &pipelineLayoutCreateInfo, nil, &pipelineLayout)
+	program.pipelineLayout = pipelineLayout
+	dynamicStates := []vk.DynamicState{
+		vk.DynamicStateViewport,
+		vk.DynamicStateScissor,
+	}
+	viewportState := vk.PipelineViewportStateCreateInfo{
+		SType:         vk.StructureTypePipelineViewportStateCreateInfo,
+		ViewportCount: 1,
+		ScissorCount:  1,
+	}
+	dynamicState := vk.PipelineDynamicStateCreateInfo{
+		SType:             vk.StructureTypePipelineDynamicStateCreateInfo,
+		DynamicStateCount: uint32(len(dynamicStates)),
+		PDynamicStates:    dynamicStates,
+	}
+	var primitiveRestartEnable vk.Bool32 = vk.False
+	if runtime.GOOS == "ios" {
+		primitiveRestartEnable = vk.True
+	}
+	inputAssemblyState := vk.PipelineInputAssemblyStateCreateInfo{
+		SType:                  vk.StructureTypePipelineInputAssemblyStateCreateInfo,
+		Topology:               vk.PrimitiveTopologyTriangleStrip,
+		PrimitiveRestartEnable: primitiveRestartEnable,
+	}
+
+	vertexInputBindings := []vk.VertexInputBindingDescription{{
+		Binding:   0,
+		Stride:    2 * 4, // 4 = sizeof(float32)
+		InputRate: vk.VertexInputRateVertex,
+	}}
+	vertexInputAttributes := []vk.VertexInputAttributeDescription{{
+		Binding:  0,
+		Location: 0,
+		Format:   vk.FormatR32g32Sfloat,
+		Offset:   0,
+	}}
+	vertexInputState := vk.PipelineVertexInputStateCreateInfo{
+		SType:                           vk.StructureTypePipelineVertexInputStateCreateInfo,
+		VertexBindingDescriptionCount:   uint32(len(vertexInputBindings)),
+		PVertexBindingDescriptions:      vertexInputBindings,
+		VertexAttributeDescriptionCount: uint32(len(vertexInputAttributes)),
+		PVertexAttributeDescriptions:    vertexInputAttributes,
+	}
+	sampleMask := []vk.SampleMask{vk.SampleMask(vk.MaxUint32)}
+	multisampleState := vk.PipelineMultisampleStateCreateInfo{
+		SType:                 vk.StructureTypePipelineMultisampleStateCreateInfo,
+		RasterizationSamples:  vk.SampleCount1Bit,
+		SampleShadingEnable:   vk.False,
+		PSampleMask:           sampleMask,
+		MinSampleShading:      1,
+		AlphaToCoverageEnable: 0,
+		AlphaToOneEnable:      0,
+	}
+	rasterState := vk.PipelineRasterizationStateCreateInfo{
+		SType:                   vk.StructureTypePipelineRasterizationStateCreateInfo,
+		DepthClampEnable:        vk.False,
+		RasterizerDiscardEnable: vk.False,
+		PolygonMode:             vk.PolygonModeFill,
+		CullMode:                vk.CullModeFlags(vk.CullModeNone),
+		FrontFace:               vk.FrontFaceClockwise,
+		DepthBiasEnable:         vk.False,
+		DepthBiasConstantFactor: 0,
+		DepthBiasClamp:          0,
+		DepthBiasSlopeFactor:    0,
+		LineWidth:               1,
+	}
+	blendFunctions := []struct {
+		op  vk.BlendOp
+		src vk.BlendFactor
+		dst vk.BlendFactor
+	}{
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorZero,
+		},
+	}
+	attachmentStates := make([]vk.PipelineColorBlendAttachmentState, 0, len(blendFunctions))
+	colorBlendStates := make([]vk.PipelineColorBlendStateCreateInfo, 0, len(blendFunctions))
+	pipelineCreateInfos := make([]vk.GraphicsPipelineCreateInfo, 0, len(blendFunctions))
+	pipelineIndexMap := map[interface{}]int{}
+	MapBlendEquation := func(i vk.BlendOp) BlendEquation {
+		var BlendEquationLUT = map[vk.BlendOp]BlendEquation{
+			vk.BlendOpAdd:             BlendAdd,
+			vk.BlendOpReverseSubtract: BlendReverseSubtract,
+		}
+		return BlendEquationLUT[i]
+	}
+
+	MapBlendFactor := func(i vk.BlendFactor) BlendFunc {
+		var MapBlendFactor = map[vk.BlendFactor]BlendFunc{
+			vk.BlendFactorOne:              BlendOne,
+			vk.BlendFactorZero:             BlendZero,
+			vk.BlendFactorSrcAlpha:         BlendSrcAlpha,
+			vk.BlendFactorOneMinusSrcAlpha: BlendOneMinusSrcAlpha,
+			vk.BlendFactorOneMinusDstColor: BlendOneMinusDstColor,
+			vk.BlendFactorDstColor:         BlendDstColor,
+		}
+		return MapBlendFactor[i]
+	}
+	var pipelineColorFormat vk.Format = vk.FormatR32g32b32a32Sfloat
+	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
+		pipelineColorFormat = vk.FormatR16g16b16a16Sfloat
+	}
+	pipelineRenderingCreateInfo := vk.PipelineRenderingCreateInfo{
+		SType:                   vk.StructureTypePipelineRenderingCreateInfo,
+		ViewMask:                0b00111111,
+		ColorAttachmentCount:    1,
+		PColorAttachmentFormats: []vk.Format{pipelineColorFormat},
+		DepthAttachmentFormat:   vk.FormatUndefined,
+		StencilAttachmentFormat: vk.FormatUndefined,
+	}
+	cPipelineRenderingCreateInfo, _ := pipelineRenderingCreateInfo.PassRef()
+	for i := range blendFunctions {
+		attachmentStates = append(attachmentStates, vk.PipelineColorBlendAttachmentState{
+			ColorWriteMask: vk.ColorComponentFlags(
+				vk.ColorComponentRBit | vk.ColorComponentGBit |
+					vk.ColorComponentBBit | vk.ColorComponentABit,
+			),
+			BlendEnable:         vk.True,
+			SrcColorBlendFactor: blendFunctions[i].src,
+			DstColorBlendFactor: blendFunctions[i].dst,
+			ColorBlendOp:        blendFunctions[i].op,
+			SrcAlphaBlendFactor: vk.BlendFactorOne,
+			DstAlphaBlendFactor: vk.BlendFactorZero,
+			AlphaBlendOp:        vk.BlendOpAdd,
+		})
+		colorBlendStates = append(colorBlendStates, vk.PipelineColorBlendStateCreateInfo{
+			SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
+			LogicOpEnable:   vk.False,
+			LogicOp:         vk.LogicOpCopy,
+			AttachmentCount: 1,
+			PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentStates[i]},
+		})
+		pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
+			SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+			StageCount:          2, // vert + frag
+			PStages:             shaderStages,
+			PVertexInputState:   &vertexInputState,
+			PInputAssemblyState: &inputAssemblyState,
+			PViewportState:      &viewportState,
+			PRasterizationState: &rasterState,
+			PMultisampleState:   &multisampleState,
+			PColorBlendState:    &colorBlendStates[i],
+			PDynamicState:       &dynamicState,
+			Layout:              program.pipelineLayout,
+			RenderPass:          nil,
+			PDepthStencilState:  nil,
+			PNext:               unsafe.Pointer(cPipelineRenderingCreateInfo),
+		})
+		pipelineIndexMap[VulkanBlendState{
+			op:  MapBlendEquation(blendFunctions[i].op),
+			src: MapBlendFactor(blendFunctions[i].src),
+			dst: MapBlendFactor(blendFunctions[i].dst),
+		}] = i
+	}
+	pipelines := make([]vk.Pipeline, len(pipelineCreateInfos))
+	err = vk.Error(vk.CreateGraphicsPipelines(r.device,
+		r.pipelineCache, uint32(len(pipelineCreateInfos)), pipelineCreateInfos, nil, pipelines))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateGraphicsPipelines failed with %s", err)
+		return nil, err
+	}
+	program.pipelines = pipelines
+	program.pipelineIndexMap = pipelineIndexMap
+	return program, nil
+}
+func (r *Renderer_VK) CreateCubemapFilteringProgram() (*VulkanProgramInfo, error) {
+	program := &VulkanProgramInfo{}
+	var err error
+	VertShader, err := staticFiles.ReadFile("shaders/ident.vert.spv")
+	if err != nil {
+		return nil, err
+	}
+	VertShader2 := make([]uint32, len(VertShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&VertShader2)).Data), VertShader)
+	vertShader, err := r.CreateShader(r.device, VertShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, vertShader, nil)
+
+	FragShader, err := staticFiles.ReadFile("shaders/cubemapFiltering.frag.spv")
+	if err != nil {
+		return nil, err
+	}
+	FragShader2 := make([]uint32, len(FragShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&FragShader2)).Data), FragShader)
+	fragShader, err := r.CreateShader(r.device, FragShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, fragShader, nil)
+	shaderStages := []vk.PipelineShaderStageCreateInfo{
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageVertexBit,
+			Module: vertShader,
+			PName:  "main\x00",
+		},
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageFragmentBit,
+			Module: fragShader,
+			PName:  "main\x00",
+		},
+	}
+
+	samplerLayoutBinding := []vk.DescriptorSetLayoutBinding{
+		{
+			Binding:            0,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+	}
+	layoutInfo := vk.DescriptorSetLayoutCreateInfo{
+		SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
+		BindingCount: 1,
+		PBindings:    samplerLayoutBinding,
+	}
+	if r.hasPushDescriptors {
+		layoutInfo.Flags = vk.DescriptorSetLayoutCreateFlags(vk.DescriptorSetLayoutCreatePushDescriptorBit)
+	}
+	var descriptorSetLayout vk.DescriptorSetLayout
+	vk.CreateDescriptorSetLayout(r.device, &layoutInfo, nil, &descriptorSetLayout)
+	program.descriptorSetLayouts = append(program.descriptorSetLayouts, descriptorSetLayout)
+	if err != nil {
+		err = fmt.Errorf("vk.CreateDescriptorSetLayout failed with %s", err)
+		return nil, err
+	}
+
+	pushConstantRanges := []vk.PushConstantRange{
+		{
+			StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+			Offset:     0,
+			Size:       4 * 6,
+		},
+	}
+	pipelineLayoutCreateInfo := vk.PipelineLayoutCreateInfo{
+		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount:         1,
+		PSetLayouts:            []vk.DescriptorSetLayout{descriptorSetLayout},
+		PushConstantRangeCount: uint32(len(pushConstantRanges)),
+		PPushConstantRanges:    pushConstantRanges,
+	}
+	var pipelineLayout vk.PipelineLayout
+	vk.CreatePipelineLayout(r.device, &pipelineLayoutCreateInfo, nil, &pipelineLayout)
+	program.pipelineLayout = pipelineLayout
+	dynamicStates := []vk.DynamicState{
+		vk.DynamicStateViewport,
+		vk.DynamicStateScissor,
+	}
+	viewportState := vk.PipelineViewportStateCreateInfo{
+		SType:         vk.StructureTypePipelineViewportStateCreateInfo,
+		ViewportCount: 1,
+		ScissorCount:  1,
+	}
+	dynamicState := vk.PipelineDynamicStateCreateInfo{
+		SType:             vk.StructureTypePipelineDynamicStateCreateInfo,
+		DynamicStateCount: uint32(len(dynamicStates)),
+		PDynamicStates:    dynamicStates,
+	}
+	var primitiveRestartEnable vk.Bool32 = vk.False
+	if runtime.GOOS == "ios" {
+		primitiveRestartEnable = vk.True
+	}
+	inputAssemblyState := vk.PipelineInputAssemblyStateCreateInfo{
+		SType:                  vk.StructureTypePipelineInputAssemblyStateCreateInfo,
+		Topology:               vk.PrimitiveTopologyTriangleStrip,
+		PrimitiveRestartEnable: primitiveRestartEnable,
+	}
+
+	vertexInputBindings := []vk.VertexInputBindingDescription{{
+		Binding:   0,
+		Stride:    2 * 4, // 4 = sizeof(float32)
+		InputRate: vk.VertexInputRateVertex,
+	}}
+	vertexInputAttributes := []vk.VertexInputAttributeDescription{{
+		Binding:  0,
+		Location: 0,
+		Format:   vk.FormatR32g32Sfloat,
+		Offset:   0,
+	}}
+	vertexInputState := vk.PipelineVertexInputStateCreateInfo{
+		SType:                           vk.StructureTypePipelineVertexInputStateCreateInfo,
+		VertexBindingDescriptionCount:   uint32(len(vertexInputBindings)),
+		PVertexBindingDescriptions:      vertexInputBindings,
+		VertexAttributeDescriptionCount: uint32(len(vertexInputAttributes)),
+		PVertexAttributeDescriptions:    vertexInputAttributes,
+	}
+	sampleMask := []vk.SampleMask{vk.SampleMask(vk.MaxUint32)}
+	multisampleState := vk.PipelineMultisampleStateCreateInfo{
+		SType:                 vk.StructureTypePipelineMultisampleStateCreateInfo,
+		RasterizationSamples:  vk.SampleCount1Bit,
+		SampleShadingEnable:   vk.False,
+		PSampleMask:           sampleMask,
+		MinSampleShading:      1,
+		AlphaToCoverageEnable: 0,
+		AlphaToOneEnable:      0,
+	}
+	rasterState := vk.PipelineRasterizationStateCreateInfo{
+		SType:                   vk.StructureTypePipelineRasterizationStateCreateInfo,
+		DepthClampEnable:        vk.False,
+		RasterizerDiscardEnable: vk.False,
+		PolygonMode:             vk.PolygonModeFill,
+		CullMode:                vk.CullModeFlags(vk.CullModeNone),
+		FrontFace:               vk.FrontFaceClockwise,
+		DepthBiasEnable:         vk.False,
+		DepthBiasConstantFactor: 0,
+		DepthBiasClamp:          0,
+		DepthBiasSlopeFactor:    0,
+		LineWidth:               1,
+	}
+	blendFunctions := []struct {
+		op  vk.BlendOp
+		src vk.BlendFactor
+		dst vk.BlendFactor
+	}{
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorZero,
+		},
+	}
+	attachmentStates := make([]vk.PipelineColorBlendAttachmentState, 0, len(blendFunctions))
+	colorBlendStates := make([]vk.PipelineColorBlendStateCreateInfo, 0, len(blendFunctions))
+	pipelineCreateInfos := make([]vk.GraphicsPipelineCreateInfo, 0, len(blendFunctions))
+	pipelineIndexMap := map[interface{}]int{}
+	MapBlendEquation := func(i vk.BlendOp) BlendEquation {
+		var BlendEquationLUT = map[vk.BlendOp]BlendEquation{
+			vk.BlendOpAdd:             BlendAdd,
+			vk.BlendOpReverseSubtract: BlendReverseSubtract,
+		}
+		return BlendEquationLUT[i]
+	}
+
+	MapBlendFactor := func(i vk.BlendFactor) BlendFunc {
+		var MapBlendFactor = map[vk.BlendFactor]BlendFunc{
+			vk.BlendFactorOne:              BlendOne,
+			vk.BlendFactorZero:             BlendZero,
+			vk.BlendFactorSrcAlpha:         BlendSrcAlpha,
+			vk.BlendFactorOneMinusSrcAlpha: BlendOneMinusSrcAlpha,
+			vk.BlendFactorOneMinusDstColor: BlendOneMinusDstColor,
+			vk.BlendFactorDstColor:         BlendDstColor,
+		}
+		return MapBlendFactor[i]
+	}
+	var pipelineColorFormat vk.Format = vk.FormatR32g32b32a32Sfloat
+	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
+		pipelineColorFormat = vk.FormatR16g16b16a16Sfloat
+	}
+	pipelineRenderingCreateInfo := vk.PipelineRenderingCreateInfo{
+		SType:                   vk.StructureTypePipelineRenderingCreateInfo,
+		ViewMask:                0b00111111,
+		ColorAttachmentCount:    1,
+		PColorAttachmentFormats: []vk.Format{pipelineColorFormat},
+		DepthAttachmentFormat:   vk.FormatUndefined,
+		StencilAttachmentFormat: vk.FormatUndefined,
+	}
+	cPipelineRenderingCreateInfo, _ := pipelineRenderingCreateInfo.PassRef()
+	for i := range blendFunctions {
+		attachmentStates = append(attachmentStates, vk.PipelineColorBlendAttachmentState{
+			ColorWriteMask: vk.ColorComponentFlags(
+				vk.ColorComponentRBit | vk.ColorComponentGBit |
+					vk.ColorComponentBBit | vk.ColorComponentABit,
+			),
+			BlendEnable:         vk.True,
+			SrcColorBlendFactor: blendFunctions[i].src,
+			DstColorBlendFactor: blendFunctions[i].dst,
+			ColorBlendOp:        blendFunctions[i].op,
+			SrcAlphaBlendFactor: vk.BlendFactorOne,
+			DstAlphaBlendFactor: vk.BlendFactorZero,
+			AlphaBlendOp:        vk.BlendOpAdd,
+		})
+		colorBlendStates = append(colorBlendStates, vk.PipelineColorBlendStateCreateInfo{
+			SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
+			LogicOpEnable:   vk.False,
+			LogicOp:         vk.LogicOpCopy,
+			AttachmentCount: 1,
+			PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentStates[i]},
+		})
+		pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
+			SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+			StageCount:          2, // vert + frag
+			PStages:             shaderStages,
+			PVertexInputState:   &vertexInputState,
+			PInputAssemblyState: &inputAssemblyState,
+			PViewportState:      &viewportState,
+			PRasterizationState: &rasterState,
+			PMultisampleState:   &multisampleState,
+			PColorBlendState:    &colorBlendStates[i],
+			PDynamicState:       &dynamicState,
+			Layout:              program.pipelineLayout,
+			RenderPass:          nil,
+			PDepthStencilState:  nil,
+			PNext:               unsafe.Pointer(cPipelineRenderingCreateInfo),
+		})
+		pipelineIndexMap[VulkanBlendState{
+			op:  MapBlendEquation(blendFunctions[i].op),
+			src: MapBlendFactor(blendFunctions[i].src),
+			dst: MapBlendFactor(blendFunctions[i].dst),
+		}] = i
+	}
+	pipelines := make([]vk.Pipeline, len(pipelineCreateInfos))
+	err = vk.Error(vk.CreateGraphicsPipelines(r.device,
+		r.pipelineCache, uint32(len(pipelineCreateInfos)), pipelineCreateInfos, nil, pipelines))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateGraphicsPipelines failed with %s", err)
+		return nil, err
+	}
+	program.pipelines = pipelines
+	program.pipelineIndexMap = pipelineIndexMap
+	return program, nil
+}
+
+func (r *Renderer_VK) CreateLutProgram() (*VulkanProgramInfo, error) {
+	program := &VulkanProgramInfo{}
+	var err error
+	VertShader, err := staticFiles.ReadFile("shaders/ident.vert.spv")
+	if err != nil {
+		return nil, err
+	}
+	VertShader2 := make([]uint32, len(VertShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&VertShader2)).Data), VertShader)
+	vertShader, err := r.CreateShader(r.device, VertShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, vertShader, nil)
+
+	FragShader, err := staticFiles.ReadFile("shaders/cubemapFiltering.frag.spv")
+	if err != nil {
+		return nil, err
+	}
+	FragShader2 := make([]uint32, len(FragShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&FragShader2)).Data), FragShader)
+	fragShader, err := r.CreateShader(r.device, FragShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, fragShader, nil)
+	shaderStages := []vk.PipelineShaderStageCreateInfo{
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageVertexBit,
+			Module: vertShader,
+			PName:  "main\x00",
+		},
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageFragmentBit,
+			Module: fragShader,
+			PName:  "main\x00",
+		},
+	}
+
+	samplerLayoutBinding := []vk.DescriptorSetLayoutBinding{
+		{
+			Binding:            0,
+			DescriptorCount:    1,
+			DescriptorType:     vk.DescriptorTypeCombinedImageSampler,
+			PImmutableSamplers: nil,
+			StageFlags:         vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+		},
+	}
+	layoutInfo := vk.DescriptorSetLayoutCreateInfo{
+		SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
+		BindingCount: 1,
+		PBindings:    samplerLayoutBinding,
+	}
+	if r.hasPushDescriptors {
+		layoutInfo.Flags = vk.DescriptorSetLayoutCreateFlags(vk.DescriptorSetLayoutCreatePushDescriptorBit)
+	}
+	var descriptorSetLayout vk.DescriptorSetLayout
+	vk.CreateDescriptorSetLayout(r.device, &layoutInfo, nil, &descriptorSetLayout)
+	program.descriptorSetLayouts = append(program.descriptorSetLayouts, descriptorSetLayout)
+	if err != nil {
+		err = fmt.Errorf("vk.CreateDescriptorSetLayout failed with %s", err)
+		return nil, err
+	}
+
+	pushConstantRanges := []vk.PushConstantRange{
+		{
+			StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+			Offset:     0,
+			Size:       4 * 6,
+		},
+	}
+	pipelineLayoutCreateInfo := vk.PipelineLayoutCreateInfo{
+		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount:         1,
+		PSetLayouts:            []vk.DescriptorSetLayout{descriptorSetLayout},
+		PushConstantRangeCount: uint32(len(pushConstantRanges)),
+		PPushConstantRanges:    pushConstantRanges,
+	}
+	var pipelineLayout vk.PipelineLayout
+	vk.CreatePipelineLayout(r.device, &pipelineLayoutCreateInfo, nil, &pipelineLayout)
+	program.pipelineLayout = pipelineLayout
+	dynamicStates := []vk.DynamicState{
+		vk.DynamicStateViewport,
+		vk.DynamicStateScissor,
+	}
+	viewportState := vk.PipelineViewportStateCreateInfo{
+		SType:         vk.StructureTypePipelineViewportStateCreateInfo,
+		ViewportCount: 1,
+		ScissorCount:  1,
+	}
+	dynamicState := vk.PipelineDynamicStateCreateInfo{
+		SType:             vk.StructureTypePipelineDynamicStateCreateInfo,
+		DynamicStateCount: uint32(len(dynamicStates)),
+		PDynamicStates:    dynamicStates,
+	}
+	var primitiveRestartEnable vk.Bool32 = vk.False
+	if runtime.GOOS == "ios" {
+		primitiveRestartEnable = vk.True
+	}
+	inputAssemblyState := vk.PipelineInputAssemblyStateCreateInfo{
+		SType:                  vk.StructureTypePipelineInputAssemblyStateCreateInfo,
+		Topology:               vk.PrimitiveTopologyTriangleStrip,
+		PrimitiveRestartEnable: primitiveRestartEnable,
+	}
+
+	vertexInputBindings := []vk.VertexInputBindingDescription{{
+		Binding:   0,
+		Stride:    2 * 4, // 4 = sizeof(float32)
+		InputRate: vk.VertexInputRateVertex,
+	}}
+	vertexInputAttributes := []vk.VertexInputAttributeDescription{{
+		Binding:  0,
+		Location: 0,
+		Format:   vk.FormatR32g32Sfloat,
+		Offset:   0,
+	}}
+	vertexInputState := vk.PipelineVertexInputStateCreateInfo{
+		SType:                           vk.StructureTypePipelineVertexInputStateCreateInfo,
+		VertexBindingDescriptionCount:   uint32(len(vertexInputBindings)),
+		PVertexBindingDescriptions:      vertexInputBindings,
+		VertexAttributeDescriptionCount: uint32(len(vertexInputAttributes)),
+		PVertexAttributeDescriptions:    vertexInputAttributes,
+	}
+	sampleMask := []vk.SampleMask{vk.SampleMask(vk.MaxUint32)}
+	multisampleState := vk.PipelineMultisampleStateCreateInfo{
+		SType:                 vk.StructureTypePipelineMultisampleStateCreateInfo,
+		RasterizationSamples:  vk.SampleCount1Bit,
+		SampleShadingEnable:   vk.False,
+		PSampleMask:           sampleMask,
+		MinSampleShading:      1,
+		AlphaToCoverageEnable: 0,
+		AlphaToOneEnable:      0,
+	}
+	rasterState := vk.PipelineRasterizationStateCreateInfo{
+		SType:                   vk.StructureTypePipelineRasterizationStateCreateInfo,
+		DepthClampEnable:        vk.False,
+		RasterizerDiscardEnable: vk.False,
+		PolygonMode:             vk.PolygonModeFill,
+		CullMode:                vk.CullModeFlags(vk.CullModeNone),
+		FrontFace:               vk.FrontFaceClockwise,
+		DepthBiasEnable:         vk.False,
+		DepthBiasConstantFactor: 0,
+		DepthBiasClamp:          0,
+		DepthBiasSlopeFactor:    0,
+		LineWidth:               1,
+	}
+	blendFunctions := []struct {
+		op  vk.BlendOp
+		src vk.BlendFactor
+		dst vk.BlendFactor
+	}{
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorZero,
+		},
+	}
+	attachmentStates := make([]vk.PipelineColorBlendAttachmentState, 0, len(blendFunctions))
+	colorBlendStates := make([]vk.PipelineColorBlendStateCreateInfo, 0, len(blendFunctions))
+	pipelineCreateInfos := make([]vk.GraphicsPipelineCreateInfo, 0, len(blendFunctions))
+	pipelineIndexMap := map[interface{}]int{}
+	MapBlendEquation := func(i vk.BlendOp) BlendEquation {
+		var BlendEquationLUT = map[vk.BlendOp]BlendEquation{
+			vk.BlendOpAdd:             BlendAdd,
+			vk.BlendOpReverseSubtract: BlendReverseSubtract,
+		}
+		return BlendEquationLUT[i]
+	}
+
+	MapBlendFactor := func(i vk.BlendFactor) BlendFunc {
+		var MapBlendFactor = map[vk.BlendFactor]BlendFunc{
+			vk.BlendFactorOne:              BlendOne,
+			vk.BlendFactorZero:             BlendZero,
+			vk.BlendFactorSrcAlpha:         BlendSrcAlpha,
+			vk.BlendFactorOneMinusSrcAlpha: BlendOneMinusSrcAlpha,
+			vk.BlendFactorOneMinusDstColor: BlendOneMinusDstColor,
+			vk.BlendFactorDstColor:         BlendDstColor,
+		}
+		return MapBlendFactor[i]
+	}
+	var pipelineColorFormat vk.Format = vk.FormatR32g32b32a32Sfloat
+	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
+		pipelineColorFormat = vk.FormatR16g16b16a16Sfloat
+	}
+	pipelineRenderingCreateInfo := vk.PipelineRenderingCreateInfo{
+		SType:                   vk.StructureTypePipelineRenderingCreateInfo,
+		ViewMask:                0b00000001,
+		ColorAttachmentCount:    1,
+		PColorAttachmentFormats: []vk.Format{pipelineColorFormat},
+		DepthAttachmentFormat:   vk.FormatUndefined,
+		StencilAttachmentFormat: vk.FormatUndefined,
+	}
+	cPipelineRenderingCreateInfo, _ := pipelineRenderingCreateInfo.PassRef()
+	for i := range blendFunctions {
+		attachmentStates = append(attachmentStates, vk.PipelineColorBlendAttachmentState{
+			ColorWriteMask: vk.ColorComponentFlags(
+				vk.ColorComponentRBit | vk.ColorComponentGBit |
+					vk.ColorComponentBBit | vk.ColorComponentABit,
+			),
+			BlendEnable:         vk.True,
+			SrcColorBlendFactor: blendFunctions[i].src,
+			DstColorBlendFactor: blendFunctions[i].dst,
+			ColorBlendOp:        blendFunctions[i].op,
+			SrcAlphaBlendFactor: vk.BlendFactorOne,
+			DstAlphaBlendFactor: vk.BlendFactorZero,
+			AlphaBlendOp:        vk.BlendOpAdd,
+		})
+		colorBlendStates = append(colorBlendStates, vk.PipelineColorBlendStateCreateInfo{
+			SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
+			LogicOpEnable:   vk.False,
+			LogicOp:         vk.LogicOpCopy,
+			AttachmentCount: 1,
+			PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentStates[i]},
+		})
+		pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
+			SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+			StageCount:          2, // vert + frag
+			PStages:             shaderStages,
+			PVertexInputState:   &vertexInputState,
+			PInputAssemblyState: &inputAssemblyState,
+			PViewportState:      &viewportState,
+			PRasterizationState: &rasterState,
+			PMultisampleState:   &multisampleState,
+			PColorBlendState:    &colorBlendStates[i],
+			PDynamicState:       &dynamicState,
+			Layout:              program.pipelineLayout,
+			RenderPass:          nil,
+			PDepthStencilState:  nil,
+			PNext:               unsafe.Pointer(cPipelineRenderingCreateInfo),
+		})
+		pipelineIndexMap[VulkanBlendState{
+			op:  MapBlendEquation(blendFunctions[i].op),
+			src: MapBlendFactor(blendFunctions[i].src),
+			dst: MapBlendFactor(blendFunctions[i].dst),
+		}] = i
+	}
+	pipelines := make([]vk.Pipeline, len(pipelineCreateInfos))
+	err = vk.Error(vk.CreateGraphicsPipelines(r.device,
+		r.pipelineCache, uint32(len(pipelineCreateInfos)), pipelineCreateInfos, nil, pipelines))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateGraphicsPipelines failed with %s", err)
+		return nil, err
+	}
+	program.pipelines = pipelines
+	program.pipelineIndexMap = pipelineIndexMap
+	return program, nil
+}
+func (r *Renderer_VK) CreateDescriptorPool() {
+	poolSize := []vk.DescriptorPoolSize{
+		{
+			Type:            vk.DescriptorTypeCombinedImageSampler,
+			DescriptorCount: uint32(len(r.renderTargets)),
+		},
+	}
+	poolInfo := vk.DescriptorPoolCreateInfo{
+		SType:         vk.StructureTypeDescriptorPoolCreateInfo,
+		PoolSizeCount: 1,
+		PPoolSizes:    poolSize,
+		MaxSets:       uint32(len(r.renderTargets)),
+	}
+	var descriptorPool vk.DescriptorPool
+	err := vk.Error(vk.CreateDescriptorPool(r.device, &poolInfo, nil, &descriptorPool))
+	r.descriptorPool = descriptorPool
+	if err != nil {
+		err = fmt.Errorf("vk.CreateDescriptorPool failed with %s", err)
+		panic(err)
+	}
+
+	descriptorSets := make([]vk.DescriptorSet, len(r.renderTargets))
+	layouts := []vk.DescriptorSetLayout{r.postProcessingProgram.descriptorSetLayouts[0], r.postProcessingProgram.descriptorSetLayouts[0]}
+	allocInfo := vk.DescriptorSetAllocateInfo{
+		SType:              vk.StructureTypeDescriptorSetAllocateInfo,
+		DescriptorPool:     descriptorPool,
+		DescriptorSetCount: uint32(len(r.renderTargets)),
+		PSetLayouts:        layouts,
+	}
+	err = vk.Error(vk.AllocateDescriptorSets(r.device, &allocInfo, &descriptorSets[0]))
+	if err != nil {
+		panic(err)
+	}
+	imageInfo := [][]vk.DescriptorImageInfo{
+		{{
+			ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
+			ImageView:   r.renderTargets[0].texture.imageView,
+			Sampler:     r.spriteSamplers[1],
+		}},
+		{{
+			ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
+			ImageView:   r.renderTargets[1].texture.imageView,
+			Sampler:     r.spriteSamplers[1],
+		}},
+	}
+	descriptorWrites := []vk.WriteDescriptorSet{
+		{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstSet:          descriptorSets[0],
+			DstBinding:      0,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			PImageInfo:      imageInfo[0],
+		},
+		{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstSet:          descriptorSets[1],
+			DstBinding:      0,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			PImageInfo:      imageInfo[1],
+		},
+	}
+	vk.UpdateDescriptorSets(r.device, uint32(len(descriptorWrites)), descriptorWrites, 0, nil)
+	r.renderTargets[0].descriptorSet = descriptorSets[0]
+	r.renderTargets[1].descriptorSet = descriptorSets[1]
+}
+func (r *Renderer_VK) CreateShader(device vk.Device, data []uint32) (vk.ShaderModule, error) {
+	var module vk.ShaderModule
+
+	shaderModuleCreateInfo := vk.ShaderModuleCreateInfo{
+		SType:    vk.StructureTypeShaderModuleCreateInfo,
+		CodeSize: uint64(len(data) * 4),
+		PCode:    data,
+	}
+	err := vk.Error(vk.CreateShaderModule(device, &shaderModuleCreateInfo, nil, &module))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateShaderModule failed with %s", err)
+		return module, err
+	}
+	return module, nil
+}
+func (r *Renderer_VK) CreateSpriteSampler() error {
+
+	interp := vk.FilterNearest
+	samplerInfo := vk.SamplerCreateInfo{
+		SType:                   vk.StructureTypeSamplerCreateInfo,
+		MagFilter:               interp,
+		MinFilter:               interp,
+		AddressModeU:            vk.SamplerAddressModeClampToEdge,
+		AddressModeV:            vk.SamplerAddressModeClampToEdge,
+		AddressModeW:            vk.SamplerAddressModeClampToEdge,
+		AnisotropyEnable:        vk.False,
+		MaxAnisotropy:           0,
+		UnnormalizedCoordinates: vk.False,
+		CompareEnable:           vk.False,
+		CompareOp:               vk.CompareOpAlways,
+		MipmapMode:              vk.SamplerMipmapModeLinear,
+		MipLodBias:              0,
+		MinLod:                  0,
+		MaxLod:                  0,
+	}
+	var sampler vk.Sampler
+	err := vk.Error(vk.CreateSampler(r.device, &samplerInfo, nil, &sampler))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateSampler failed with %s", err)
+		return err
+	}
+	r.spriteSamplers = append(r.spriteSamplers, sampler)
+	interp = vk.FilterLinear
+	samplerInfo2 := vk.SamplerCreateInfo{
+		SType:                   vk.StructureTypeSamplerCreateInfo,
+		MagFilter:               interp,
+		MinFilter:               interp,
+		AddressModeU:            vk.SamplerAddressModeClampToEdge,
+		AddressModeV:            vk.SamplerAddressModeClampToEdge,
+		AddressModeW:            vk.SamplerAddressModeClampToEdge,
+		AnisotropyEnable:        vk.False,
+		MaxAnisotropy:           0,
+		UnnormalizedCoordinates: vk.False,
+		CompareEnable:           vk.False,
+		CompareOp:               vk.CompareOpAlways,
+		MipmapMode:              vk.SamplerMipmapModeLinear,
+		MipLodBias:              0,
+		MinLod:                  0,
+		MaxLod:                  0,
+	}
+	var sampler2 vk.Sampler
+	err = vk.Error(vk.CreateSampler(r.device, &samplerInfo2, nil, &sampler2))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateSampler failed with %s", err)
+		return err
+	}
+	r.spriteSamplers = append(r.spriteSamplers, sampler2)
+	return nil
+}
+func (r *Renderer_VK) GetSampler(info VulkanSamplerInfo) vk.Sampler {
+	if sampler, ok := r.samplers[info]; ok {
+		return sampler
+	}
+	samplerInfo := vk.SamplerCreateInfo{
+		SType:                   vk.StructureTypeSamplerCreateInfo,
+		MagFilter:               vk.FilterNearest,
+		MinFilter:               vk.FilterNearest,
+		AddressModeU:            vk.SamplerAddressModeClampToEdge,
+		AddressModeV:            vk.SamplerAddressModeClampToEdge,
+		AddressModeW:            vk.SamplerAddressModeClampToEdge,
+		AnisotropyEnable:        vk.False,
+		MaxAnisotropy:           0,
+		UnnormalizedCoordinates: vk.False,
+		CompareEnable:           vk.False,
+		CompareOp:               vk.CompareOpAlways,
+		MipmapMode:              vk.SamplerMipmapModeLinear,
+		MipLodBias:              0,
+		MinLod:                  0,
+		MaxLod:                  vk.LodClampNone,
+	}
+	if info.magFilter == TextureSamplingFilterLinear {
+		samplerInfo.MagFilter = vk.FilterLinear
+	}
+	if info.minFilter == TextureSamplingFilterLinear || info.minFilter == TextureSamplingFilterLinearMipMapLinear || info.minFilter == TextureSamplingFilterLinearMipMapNearest {
+		samplerInfo.MinFilter = vk.FilterLinear
+	}
+	if info.minFilter == TextureSamplingFilterLinearMipMapNearest || info.minFilter == TextureSamplingFilterNearestMipMapNearest {
+		samplerInfo.MipmapMode = vk.SamplerMipmapModeNearest
+	}
+	if info.minFilter == TextureSamplingFilterLinear || info.minFilter == TextureSamplingFilterNearest {
+		samplerInfo.MaxLod = 0
+	}
+	if info.wrapS == TextureSamplingWrapMirroredRepeat {
+		samplerInfo.AddressModeU = vk.SamplerAddressModeMirroredRepeat
+	} else if info.wrapS == TextureSamplingWrapRepeat {
+		samplerInfo.AddressModeU = vk.SamplerAddressModeRepeat
+	}
+	if info.wrapT == TextureSamplingWrapMirroredRepeat {
+		samplerInfo.AddressModeV = vk.SamplerAddressModeMirroredRepeat
+	} else if info.wrapT == TextureSamplingWrapRepeat {
+		samplerInfo.AddressModeV = vk.SamplerAddressModeRepeat
+	}
+	var sampler vk.Sampler
+	err := vk.Error(vk.CreateSampler(r.device, &samplerInfo, nil, &sampler))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateSampler failed with %s", err)
+		panic(err)
+	}
+	r.samplers[info] = sampler
+	return sampler
+}
+func (r *Renderer_VK) CreateSwapChainFramebuffer(swapchain *VulkanSwapchainInfo, renderPass vk.RenderPass) error {
+	var swapchainImagesCount uint32
+	err := vk.Error(vk.GetSwapchainImages(r.device, swapchain.swapchain, &swapchainImagesCount, nil))
+	if err != nil {
+		err = fmt.Errorf("vk.GetSwapchainImages failed with %s", err)
+		return err
+	}
+	swapchainImages := make([]vk.Image, swapchainImagesCount)
+	vk.GetSwapchainImages(r.device, swapchain.swapchain, &swapchainImagesCount, swapchainImages)
+	swapchain.framebuffers = make([]vk.Framebuffer, swapchain.imageCount)
+	for i := range swapchain.framebuffers {
+		attachments := []vk.ImageView{}
+		attachments = append(attachments, swapchain.imageViews[i])
+		fbCreateInfo := vk.FramebufferCreateInfo{
+			SType:           vk.StructureTypeFramebufferCreateInfo,
+			RenderPass:      renderPass,
+			Layers:          1,
+			AttachmentCount: uint32(len(attachments)), // 2 if has depthView
+			PAttachments:    attachments,
+			Width:           swapchain.extent.Width,
+			Height:          swapchain.extent.Height,
+		}
+		err := vk.Error(vk.CreateFramebuffer(r.device, &fbCreateInfo, nil, &swapchain.framebuffers[i]))
+		if err != nil {
+			err = fmt.Errorf("vk.CreateFramebuffer failed with %s", err)
+			return err
+		}
+	}
+	return nil
+}
+func (r *Renderer_VK) CreateCommandPool() error {
+	cmdPoolCreateInfo := vk.CommandPoolCreateInfo{
+		SType:            vk.StructureTypeCommandPoolCreateInfo,
+		Flags:            vk.CommandPoolCreateFlags(vk.CommandPoolCreateResetCommandBufferBit),
+		QueueFamilyIndex: 0,
+	}
+	var commandPool1, commandPool2 vk.CommandPool
+	err := vk.Error(vk.CreateCommandPool(r.device, &cmdPoolCreateInfo, nil, &commandPool1))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateCommandPool failed with %s", err)
+		return err
+	}
+	err = vk.Error(vk.CreateCommandPool(r.device, &cmdPoolCreateInfo, nil, &commandPool2))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateCommandPool failed with %s", err)
+		return err
+	}
+
+	r.commandPools = []vk.CommandPool{commandPool1, commandPool2}
+	return nil
+}
+func (r *Renderer_VK) CreateCommandBuffer() error {
+	commandBuffer1 := make([]vk.CommandBuffer, 1)
+	commandBuffer2 := make([]vk.CommandBuffer, 1)
+	cmdBufferAllocateInfo := vk.CommandBufferAllocateInfo{
+		SType:              vk.StructureTypeCommandBufferAllocateInfo,
+		CommandPool:        r.commandPools[0],
+		Level:              vk.CommandBufferLevelPrimary,
+		CommandBufferCount: 1,
+	}
+	err := vk.Error(vk.AllocateCommandBuffers(r.device, &cmdBufferAllocateInfo, commandBuffer1))
+	if err != nil {
+		err = fmt.Errorf("vk.AllocateCommandBuffers failed with %s", err)
+		return err
+	}
+	cmdBufferAllocateInfo2 := vk.CommandBufferAllocateInfo{
+		SType:              vk.StructureTypeCommandBufferAllocateInfo,
+		CommandPool:        r.commandPools[1],
+		Level:              vk.CommandBufferLevelPrimary,
+		CommandBufferCount: 1,
+	}
+	//cmdBufferAllocateInfo.CommandPool = v.commandPools[1]
+	err = vk.Error(vk.AllocateCommandBuffers(r.device, &cmdBufferAllocateInfo2, commandBuffer2))
+	if err != nil {
+		err = fmt.Errorf("vk.AllocateCommandBuffers failed with %s", err)
+		return err
+	}
+	r.commandBuffers = []vk.CommandBuffer{commandBuffer1[0], commandBuffer2[0]}
+	return nil
+}
+func (r *Renderer_VK) CreateSyncObjects() error {
+	fenceCreateInfo := vk.FenceCreateInfo{
+		SType: vk.StructureTypeFenceCreateInfo,
+		Flags: vk.FenceCreateFlags(vk.FenceCreateSignaledBit),
+	}
+	semaphoreCreateInfo := vk.SemaphoreCreateInfo{
+		SType: vk.StructureTypeSemaphoreCreateInfo,
+	}
+	r.fences = make([]vk.Fence, 3)
+	err := vk.Error(vk.CreateFence(r.device, &fenceCreateInfo, nil, &r.fences[0]))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateFence failed with %s", err)
+		return err
+	}
+	err = vk.Error(vk.CreateFence(r.device, &fenceCreateInfo, nil, &r.fences[1]))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateFence failed with %s", err)
+		return err
+	}
+	err = vk.Error(vk.CreateFence(r.device, &fenceCreateInfo, nil, &r.fences[2]))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateFence failed with %s", err)
+		return err
+	}
+	r.semaphores = make([]vk.Semaphore, r.swapchains[0].imageCount+1)
+	for i := range len(r.semaphores) {
+		err = vk.Error(vk.CreateSemaphore(r.device, &semaphoreCreateInfo, nil, &r.semaphores[i]))
+		if err != nil {
+			err = fmt.Errorf("vk.CreateSemaphore failed with %s", err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Renderer_VK) DestroyPipelines(program *VulkanProgramInfo) {
+	for i := range program.uniformBuffers {
+		vk.UnmapMemory(r.device, program.uniformBuffers[i].bufferMemory)
+		vk.DestroyBuffer(r.device, program.uniformBuffers[i].buffer, nil)
+		vk.FreeMemory(r.device, program.uniformBuffers[i].bufferMemory, nil)
+	}
+	vk.DestroyPipelineLayout(r.device, program.pipelineLayout, nil)
+	for i := range program.pipelines {
+		vk.DestroyPipeline(r.device, program.pipelines[i], nil)
+	}
+	if program.vertShader != nil {
+		vk.DestroyShaderModule(r.device, program.vertShader, nil)
+		vk.DestroyShaderModule(r.device, program.fragShader, nil)
+	}
+
+}
+func (r *Renderer_VK) DestroySwapchain() {
+	for i := range r.swapchains {
+		if r.swapchains[i] == nil {
+			continue
+		}
+
+		for j := range r.swapchains[i].framebuffers {
+			if r.swapchains[i].framebuffers[j] != vk.NullFramebuffer {
+				vk.DestroyFramebuffer(r.device, r.swapchains[i].framebuffers[j], nil)
+			}
+		}
+		r.swapchains[i].framebuffers = nil
+
+		for j := range r.swapchains[i].imageViews {
+			if r.swapchains[i].imageViews[j] != vk.NullImageView {
+				vk.DestroyImageView(r.device, r.swapchains[i].imageViews[j], nil)
+			}
+		}
+		r.swapchains[i].imageViews = nil
+
+		if r.swapchains[i].swapchain != vk.NullSwapchain {
+			vk.DestroySwapchain(r.device, r.swapchains[i].swapchain, nil)
+			r.swapchains[i].swapchain = vk.NullSwapchain
+		}
+	}
+}
+func (r *Renderer_VK) DestroyRenderTarget(renderTarget *VulkanRenderTargetInfo) {
+	vk.DestroyFramebuffer(r.device, renderTarget.framebuffer, nil)
+	renderTarget.texture = nil
+}
+func (r *Renderer_VK) Destroy() {
+	if r == nil {
+		return
+	}
+	r.gpuDevices = nil
+	vk.QueueWaitIdle(r.queue)
+	r.shadowMapTextures = nil
+	r.dummyTexture = nil
+	r.dummyCubeTexture = nil
+	for i := range r.palTexture.textures {
+		r.palTexture.textures[i] = nil
+	}
+
+	//Save Vulkan pipeline cache to disk
+	var pipelineCacheSize uint64
+	err := vk.Error(vk.GetPipelineCacheData(r.device, r.pipelineCache, &pipelineCacheSize, nil))
+	if err != nil {
+		err = fmt.Errorf("vk.GetPipelineCacheData failed with %s", err)
+		fmt.Println(err)
+	} else {
+		pipelineCacheData := make([]byte, pipelineCacheSize)
+		err = vk.Error(vk.GetPipelineCacheData(r.device, r.pipelineCache, &pipelineCacheSize, unsafe.Pointer(&pipelineCacheData[0])))
+		if err != nil {
+			err = fmt.Errorf("vk.GetPipelineCacheData failed with %s", err)
+			LogMessage("%v", err)
+		} else {
+			_ = os.MkdirAll("./cache/Vulkan", os.ModePerm)
+			err = os.WriteFile("./cache/Vulkan/pipeline_cache.bin", pipelineCacheData, 0644)
+			if err != nil {
+				LogMessage("Failed to write pipeline cache to disk:", err)
+			}
+		}
+	}
+	vk.DestroyPipelineCache(r.device, r.pipelineCache, nil)
+	for i := range r.vertexBuffers {
+		vk.UnmapMemory(r.device, r.vertexBuffers[i].bufferMemory)
+		vk.DestroyBuffer(r.device, r.vertexBuffers[i].buffer, nil)
+		vk.FreeMemory(r.device, r.vertexBuffers[i].bufferMemory, nil)
+	}
+
+	vk.UnmapMemory(r.device, r.stagingBuffers[0].bufferMemory)
+	vk.DestroyBuffer(r.device, r.stagingBuffers[0].buffer, nil)
+	vk.FreeMemory(r.device, r.stagingBuffers[0].bufferMemory, nil)
+
+	vk.UnmapMemory(r.device, r.stagingBuffers[1].bufferMemory)
+	vk.DestroyBuffer(r.device, r.stagingBuffers[1].buffer, nil)
+	vk.FreeMemory(r.device, r.stagingBuffers[1].bufferMemory, nil)
+
+	for i := range r.modelVertexBuffers {
+		vk.DestroyBuffer(r.device, r.modelVertexBuffers[i].buffer, nil)
+		vk.FreeMemory(r.device, r.modelVertexBuffers[i].bufferMemory, nil)
+		vk.DestroyBuffer(r.device, r.modelIndexBuffers[i].buffer, nil)
+		vk.FreeMemory(r.device, r.modelIndexBuffers[i].bufferMemory, nil)
+	}
+
+	for sampler := range r.spriteSamplers {
+		vk.DestroySampler(r.device, r.spriteSamplers[sampler], nil)
+	}
+	for key := range r.samplers {
+		vk.DestroySampler(r.device, r.samplers[key], nil)
+	}
+	vk.DestroySemaphore(r.device, r.semaphores[0], nil)
+	vk.DestroySemaphore(r.device, r.semaphores[1], nil)
+	vk.DestroyFence(r.device, r.fences[0], nil)
+	vk.DestroyFence(r.device, r.fences[1], nil)
+	vk.DestroyFence(r.device, r.fences[2], nil)
+	vk.DestroyCommandPool(r.device, r.commandPools[0], nil)
+	vk.DestroyCommandPool(r.device, r.commandPools[1], nil)
+	r.DestroyPipelines(r.spriteProgram)
+	if r.modelProgram != nil {
+		r.DestroyPipelines(r.modelProgram)
+		if r.shadowMapProgram != nil {
+			r.DestroyPipelines(r.shadowMapProgram)
+		}
+	}
+	r.DestroyPipelines(r.postProcessingProgram)
+	r.DestroyPipelines(r.lutProgram)
+	r.DestroyPipelines(r.cubemapFilteringProgram)
+	r.DestroyPipelines(r.panoramaToCubeMapProgram)
+	vk.DestroyRenderPass(r.device, r.swapchainRenderPass.renderPass, nil)
+	vk.DestroyRenderPass(r.device, r.mainRenderPass.renderPass, nil)
+	r.DestroyRenderTarget(r.mainRenderTarget)
+	r.DestroyRenderTarget(r.renderTargets[0])
+	r.DestroyRenderTarget(r.renderTargets[1])
+	r.DestroySwapchain()
+
+	runtime.GC()
+	r.DestroyResources(len(r.destroyResourceQueues[r.destroyResourceQueueIndex]))
+	r.destroyResourceQueueIndex = (r.destroyResourceQueueIndex + 1) % 2
+	r.DestroyResources(len(r.destroyResourceQueues[r.destroyResourceQueueIndex]))
+
+	// Clean up remaining allocator memory blocks after all resources are destroyed.
+	r.allocator.mu.Lock()
+	for _, block := range r.allocator.blocks {
+		vk.FreeMemory(r.device, block.deviceMemory, nil)
+	}
+	r.allocator.blocks = nil
+	r.allocator.mu.Unlock()
+
+	vk.DestroySurface(r.instance, r.surface, nil)
+	vk.DestroyDevice(r.device, nil)
+	vk.DestroyInstance(r.instance, nil)
+}
+func (r *Renderer_VK) BeginSingleTimeCommands() vk.CommandBuffer {
+	commandBuffers := make([]vk.CommandBuffer, 1)
+	cmdBufferAllocateInfo := vk.CommandBufferAllocateInfo{
+		SType:              vk.StructureTypeCommandBufferAllocateInfo,
+		CommandPool:        r.commandPools[0],
+		Level:              vk.CommandBufferLevelPrimary,
+		CommandBufferCount: 1,
+	}
+	err := vk.Error(vk.AllocateCommandBuffers(r.device, &cmdBufferAllocateInfo, commandBuffers))
+	if err != nil {
+		err = fmt.Errorf("vk.AllocateCommandBuffers failed with %s", err)
+		panic(err)
+	}
+	cmdBufferBeginInfo := vk.CommandBufferBeginInfo{
+		SType:            vk.StructureTypeCommandBufferBeginInfo,
+		Flags:            vk.CommandBufferUsageFlags(vk.CommandBufferUsageOneTimeSubmitBit),
+		PInheritanceInfo: nil,
+	}
+	vk.BeginCommandBuffer(commandBuffers[0], &cmdBufferBeginInfo)
+	return commandBuffers[0]
+}
+func (r *Renderer_VK) EndSingleTimeCommands(commandBuffer vk.CommandBuffer) {
+	vk.EndCommandBuffer(commandBuffer)
+	commandBuffers := []vk.CommandBuffer{commandBuffer}
+	submitInfo := []vk.SubmitInfo{{
+		SType:              vk.StructureTypeSubmitInfo,
+		CommandBufferCount: 1,
+		PCommandBuffers:    commandBuffers,
+	}}
+	vk.QueueSubmit(r.queue, 1, submitInfo, nil)
+	vk.QueueWaitIdle(r.queue)
+	vk.FreeCommandBuffers(r.device, r.commandPools[0], 1, commandBuffers)
+}
+
+func (r *Renderer_VK) CreateMemoryBuffers() error {
+	var vertexBufferMemory vk.DeviceMemory
+	var err error
+	r.vertexBuffers = make([]VulkanBuffer, 1)
+	r.vertexBuffers[0].size = 40000 * 4 * 4
+	r.vertexBuffers[0].buffer, err = r.CreateBuffer(vk.DeviceSize(r.vertexBuffers[0].size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageVertexBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &vertexBufferMemory)
+	if err != nil {
+		return err
+	}
+	r.vertexBuffers[0].bufferMemory = vertexBufferMemory
+	var vertexData unsafe.Pointer
+	vk.MapMemory(r.device, r.vertexBuffers[0].bufferMemory, 0, vk.DeviceSize(r.vertexBuffers[0].size), 0, &vertexData)
+	r.vertexBuffers[0].data = vertexData
+
+	for i := 0; i < 2; i++ {
+		var stagingBufferMemory vk.DeviceMemory
+		r.stagingBuffers[i].size = 4096 * 4096 * 4
+		r.stagingBuffers[i].buffer, err = r.CreateBuffer(vk.DeviceSize(r.stagingBuffers[i].size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &stagingBufferMemory)
+		if err != nil {
+			panic(err)
+		}
+		r.stagingBuffers[i].bufferMemory = stagingBufferMemory
+		var stagingData unsafe.Pointer
+		vk.MapMemory(r.device, stagingBufferMemory, 0, vk.DeviceSize(r.stagingBuffers[i].size), 0, &stagingData)
+		r.stagingBuffers[i].data = stagingData
+	}
+
+	r.modelVertexBuffers = make([]VulkanBuffer, 2)
+	r.modelIndexBuffers = make([]VulkanBuffer, 2)
+	for i := 0; i < 2; i++ {
+		r.modelVertexBuffers[i].size = 0
+		r.modelIndexBuffers[i].size = 0
+	}
+	return nil
+}
+
+func (r *Renderer_VK) CreatePipelineCache() error {
+	pipelineCacheInfo := vk.PipelineCacheCreateInfo{
+		SType: vk.StructureTypePipelineCacheCreateInfo,
+	}
+	cacheFile, err := os.Open("./cache/Vulkan/pipeline_cache.bin")
+	if err == nil {
+		defer cacheFile.Close()
+		cacheData, err := io.ReadAll(cacheFile)
+		// go 1.21+ feature
+		// pinner := runtime.Pinner{}
+		// pinner.Pin(&cacheData[0])
+		// defer pinner.Unpin()
+		if err == nil {
+			pipelineCacheInfo.InitialDataSize = uint64(len(cacheData))
+			pipelineCacheInfo.PInitialData = unsafe.Pointer(&cacheData[0])
+		} else {
+			LogMessage("Cannot read Vulkan pipeline cache file, a new one will be created")
+		}
+	} else {
+		LogMessage("Cannot open Vulkan pipeline cache file, a new one will be created")
+	}
+	var cache vk.PipelineCache
+	err = vk.Error(vk.CreatePipelineCache(r.device, &pipelineCacheInfo, nil, &cache))
+	if err != nil {
+		LogMessage("vk.CreatePipelineCache failed with %s", err)
+		if pipelineCacheInfo.InitialDataSize > 0 {
+			LogMessage("Creating an empty pipeline cache instead")
+			pipelineCacheInfo2 := vk.PipelineCacheCreateInfo{
+				SType: vk.StructureTypePipelineCacheCreateInfo,
+			}
+			err = vk.Error(vk.CreatePipelineCache(r.device, &pipelineCacheInfo2, nil, &cache))
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	r.pipelineCache = cache
+	return nil
+}
+
+// Render initialization.
+// Creates the default shaders, the framebuffer and enables MSAA.
+func (r *Renderer_VK) Init() {
+	r.firstFrame = true
+	r.allocatedImageMemory = 0
+	r.enableModel = sys.cfg.Video.EnableModel
+	r.enableShadow = sys.cfg.Video.EnableModelShadow
+	r.memoryTypeMap = make(map[vk.MemoryPropertyFlagBits]uint32)
+	r.samplers = map[VulkanSamplerInfo]vk.Sampler{}
+	r.stagingBufferFences = [2]bool{true, true}
+	r.stagingBufferIndex = 0
+	r.stagingBufferOffset = 0
+	r.stagingImageCopyRegions = make(map[vk.Image][]vk.BufferImageCopy)
+	r.VKState.VulkanModelPipelineState.VulkanModelSpecializationConstants1.useShadowMap = r.enableShadow
+	r.setVSync = false
+	r.shouldDoPerDrawPushDrawConstants = (runtime.GOOS == "darwin" || runtime.GOOS == "ios")
+	r.poolMutex = sync.Mutex{}
+	vk.SetGetInstanceProcAddr(sdl.VulkanGetVkGetInstanceProcAddr())
+	err := vk.Init()
+	if err != nil {
+		panic(err)
+	}
+	err = r.NewVulkanDevice(appInfo)
+	if err != nil {
+		if len(r.gpuDevices) > 0 {
+			r.PrintInfo()
+		}
+		panic(err)
+	}
+
+	var memProperties vk.PhysicalDeviceMemoryProperties
+	vk.GetPhysicalDeviceMemoryProperties(r.gpuDevices[r.gpuIndex], &memProperties)
+	var deviceLocalHeapSize vk.DeviceSize
+	var deviceLocalHeapIndex uint32
+	for i := uint32(0); i < memProperties.MemoryHeapCount; i++ {
+		heap := memProperties.MemoryHeaps[i]
+		if heap.Flags&vk.MemoryHeapFlags(vk.MemoryHeapDeviceLocalBit) != 0 {
+			if heap.Size > deviceLocalHeapSize {
+				deviceLocalHeapSize = heap.Size
+				deviceLocalHeapIndex = i
+			}
+		}
+	}
+	r.deviceLocalHeapSize = deviceLocalHeapSize
+	r.deviceLocalHeapIndex = deviceLocalHeapIndex
+
+	// Detect VK_EXT_memory_budget extension.
+	r.budgetEnabled = r.hasDeviceExtension("VK_EXT_memory_budget")
+	r.vramSwapThresholdPercent = sys.cfg.Video.VRAMSwapThresholdPercent
+	r.vramSwapCooldownFrames = sys.cfg.Video.VRAMSwapCooldownFrames
+	r.vramFallbackEnabled = sys.cfg.Video.VRAMFallbackEnabled
+	r.lastSwapFrame = 0
+	r.totalImageBytesAllocated = 0
+
+	suballocThreshold := vk.DeviceSize(sys.cfg.Video.ImageSuballocThresholdKB) * 1024
+	if suballocThreshold == 0 {
+		suballocThreshold = vk.DeviceSize(256) * 1024
+	}
+	blockSize := vk.DeviceSize(sys.cfg.Video.ImageSuballocBlockSizeMB) * 1024 * 1024
+	if blockSize == 0 {
+		blockSize = vk.DeviceSize(64) * 1024 * 1024
+	}
+	// Cap blockSize at 25% of device-local heap.
+	if deviceLocalHeapSize > 0 {
+		maxBlock := deviceLocalHeapSize / 4
+		if maxBlock < blockSize {
+			blockSize = maxBlock
+		}
+	}
+	r.allocator = &VulkanAllocator{
+		renderer:            r,
+		memoryTypeCache:     make(map[uint64]uint32),
+		blocks:              make([]*VulkanMemoryBlock, 0),
+		nextBlockID:         1,
+		smallImageThreshold: suballocThreshold,
+		blockSize:           blockSize,
+		allocations:         make(map[vk.Image]*VulkanAllocation),
+	}
+	r.currentFrameNumber = 0
+	r.swappableTextures = make(map[*Texture_VK]bool)
+	err = r.CreateSwapchain(vk.NullSwapchain)
+	if err != nil {
+		panic(err)
+	}
+
+	if runtime.GOOS == "ios" {
+		if id, idErr := sys.window.Window.GetID(); idErr == nil {
+			attachIOSMetalLayer(id)
+		}
+	}
+	err = r.CreateMemoryBuffers()
+	if err != nil {
+		panic(err)
+	}
+	r.swapchainRenderPass, err = r.CreateSwapchainRenderPass(r.swapchains[0])
+	if err != nil {
+		panic(err)
+	}
+	msaa := sys.msaa
+	if msaa <= 0 {
+		msaa = 1
+	}
+	r.mainRenderPass, err = r.CreateMainRenderPass(r.swapchains[0], msaa, true)
+	if err != nil {
+		panic(err)
+	}
+	r.postProcessingRenderPass, err = r.CreatePostProcessingRenderPass(r.swapchains[0])
+	if err != nil {
+		panic(err)
+	}
+	r.CreatePipelineCache()
+	r.spriteProgram, err = r.CreateSpriteProgram()
+	if err != nil {
+		panic(err)
+	}
+
+	r.customPrograms = make(map[uint32]*VulkanProgramInfo)
+	r.customShaderMap = make(map[string]uint32)
+	r.nextShaderID = 1
+
+	tex, err := r.newTexture(sys.scrrect[2], sys.scrrect[3], 32, true)
+	if err != nil {
+		panic(fmt.Errorf("grabTexture: %w", err))
+	}
+	r.grabTexture = tex.(*Texture_VK)
+	// Grab texture is a screen capture target — must not be swapped out.
+	r.grabTexture.MarkNonSwappable()
+
+	r.postProcessingProgram, err = r.CreateFullScreenShaderProgram(sys.externalShaders)
+	if err != nil {
+		panic(err)
+	}
+
+	r.panoramaToCubeMapProgram, err = r.CreatePanoramaToCubeMapProgram()
+	if err != nil {
+		panic(err)
+	}
+
+	r.cubemapFilteringProgram, err = r.CreateCubemapFilteringProgram()
+	if err != nil {
+		panic(err)
+	}
+	r.lutProgram, err = r.CreateLutProgram()
+	if err != nil {
+		panic(err)
+	}
+	err = r.CreateSpriteSampler()
+	if err != nil {
+		panic(err)
+	}
+	err = r.CreateCommandPool()
+	if err != nil {
+		panic(err)
+	}
+	err = r.CreateCommandBuffer()
+	if err != nil {
+		panic(err)
+	}
+	r.renderTargets[0] = r.CreateRenderTarget(r.swapchainRenderPass.renderPass, uint32(sys.scrrect[2]), uint32(sys.scrrect[3]), 1, false)
+	r.renderTargets[1] = r.CreateRenderTarget(r.swapchainRenderPass.renderPass, uint32(sys.scrrect[2]), uint32(sys.scrrect[3]), 1, false)
+	r.mainRenderTarget = r.CreateRenderTarget(r.mainRenderPass.renderPass, uint32(sys.scrrect[2]), uint32(sys.scrrect[3]), msaa, true)
+
+	err = r.CreateSyncObjects()
+	if err != nil {
+		panic(err)
+	}
+	err = r.CreateSwapChainFramebuffer(r.swapchains[0], r.swapchainRenderPass.renderPass)
+	if err != nil {
+		panic(err)
+	}
+	r.CreateDescriptorPool()
+	r.VKState.scissor = vk.Rect2D{
+		Extent: r.swapchains[0].extent,
+		Offset: vk.Offset2D{
+			X: 0, Y: 0,
+		},
+	}
+	tex2, err := r.newTexture(1, 1, 8, false)
+	if err != nil {
+		panic(fmt.Errorf("dummyTexture: %w", err))
+	}
+	r.dummyTexture = tex2.(*Texture_VK)
+	r.dummyTexture.MarkNonSwappable() // Dummy texture must stay resident.
+	r.dummyTexture.SetData([]byte{0})
+	r.dummyTexture.sampler = r.spriteSamplers[0]
+
+	tex2, err = r.newTexture(1, 1, 32, false)
+	if err != nil {
+		panic(fmt.Errorf("dummyNormalTexture: %w", err))
+	}
+	r.dummyNormalTexture = tex2.(*Texture_VK)
+	r.dummyNormalTexture.MarkNonSwappable() // Dummy texture must stay resident.
+	r.dummyNormalTexture.SetData([]byte{128, 128, 255, 255})
+	r.dummyNormalTexture.sampler = r.spriteSamplers[0]
+
+	tex2, err = r.newTexture(1, 1, 32, false)
+	if err != nil {
+		panic(fmt.Errorf("dummyWhiteTexture: %w", err))
+	}
+	r.dummyWhiteTexture = tex2.(*Texture_VK)
+	r.dummyWhiteTexture.MarkNonSwappable() // Dummy texture must stay resident.
+	r.dummyWhiteTexture.SetData([]byte{255, 255, 255, 255})
+	r.dummyWhiteTexture.sampler = r.spriteSamplers[0]
+
+	dummyCube, err := r.newDummyCubeMapTexture()
+	if err != nil {
+		panic(fmt.Errorf("dummyCubeTexture: %w", err))
+	}
+	r.dummyCubeTexture = dummyCube
+	r.dummyCubeTexture.SetCubeMapData([]byte{0})
+	r.dummyCubeTexture.sampler = r.spriteSamplers[0]
+
+	r.spriteProgram.uniformOffsetMap = map[interface{}]uint32{}
+	r.createPalTexture(2048)
+	r.shadowMapTextures = r.createShadowMapTexture(1024)
+	if r.enableModel {
+		r.modelProgram, err = r.CreateModelProgram()
+		if err != nil {
+			panic(err)
+		}
+		if r.enableShadow {
+			r.shadowMapProgram, err = r.CreateShadowMapProgram()
+			if err != nil {
+				panic(err)
+			}
+		}
+	}
+	r.destroyResourceQueues[0] = make(chan VulkanResource, 65536)
+	r.destroyResourceQueues[1] = make(chan VulkanResource, 65536)
+	r.destroyResourceQueueIndex = 0
+}
+
+func (r *Renderer_VK) Close() {
+	r.Destroy()
+}
+
+func (r *Renderer_VK) EnableDebug() {
+	// Do nothing
+}
+
+func (r *Renderer_VK) IsModelEnabled() bool {
+	return r.enableModel
+}
+
+func (r *Renderer_VK) IsShadowEnabled() bool {
+	return r.enableShadow
+}
+
+func (r *Renderer_VK) DestroyResources(queueLength int) {
+	empty := false
+	for i := 0; i < queueLength && !empty; i++ {
+		select {
+		case res := <-r.destroyResourceQueues[r.destroyResourceQueueIndex]:
+			switch res.resourceType {
+			case VulkanResourceTypeTexture:
+				alloc := res.resources[3].(*VulkanAllocation)
+				if alloc.dedicated {
+					vk.DestroyImageView(r.device, res.resources[1].(vk.ImageView), nil)
+					vk.DestroyImage(r.device, res.resources[0].(vk.Image), nil)
+					r.allocator.FreeImageAllocation(res.resources[0].(vk.Image), alloc)
+				} else {
+					// Suballocated: free-list update is safe before destroy since the block persists.
+					r.allocator.FreeImageAllocation(res.resources[0].(vk.Image), alloc)
+					vk.DestroyImageView(r.device, res.resources[1].(vk.ImageView), nil)
+					vk.DestroyImage(r.device, res.resources[0].(vk.Image), nil)
+				}
+				break
+			case VulkanResourceTypePaletteTexture:
+				r.palTexture.emptySlot.PushFront(res.resources[0])
+				break
+			case VulkanResourceTypeBuffer:
+				vk.DestroyBuffer(r.device, res.resources[0].(vk.Buffer), nil)
+				vk.FreeMemory(r.device, res.resources[1].(vk.DeviceMemory), nil)
+				break
+			case VulkanResourceTypeFence:
+				vk.WaitForFences(r.device, 1, []vk.Fence{res.resources[0].(vk.Fence)}, vk.True, 10*1000*1000*1000)
+				vk.DestroyFence(r.device, res.resources[0].(vk.Fence), nil)
+				break
+			}
+		default:
+			empty = true
+		}
+	}
+}
+
+// destroyOrDeferImageResources destroys Vulkan image resources either immediately
+// or deferred via the destroy queue, depending on whether the GPU is still using them.
+//
+// If lastUsedFrame <= currentFrameNumber-3, the texture hasn't been used in at least
+// 3 frames, so the GPU is guaranteed done with it (the oldest possible in-flight
+// command buffer is from currentFrameNumber-1). Immediate destruction is safe.
+// Otherwise, destruction is deferred to the next frame via the destroy queue to
+// avoid destroying objects that the in-flight command buffer may still reference.
+func (r *Renderer_VK) destroyOrDeferImageResources(lastUsedFrame uint64, img vk.Image, imageView vk.ImageView, allocation *VulkanAllocation) {
+	if lastUsedFrame == 0 || lastUsedFrame <= r.currentFrameNumber-3 {
+		// GPU is done with this texture — destroy immediately.
+		if imageView != nil {
+			vk.DestroyImageView(r.device, imageView, nil)
+		}
+		if img != nil {
+			vk.DestroyImage(r.device, img, nil)
+			if allocation != nil {
+				r.allocator.FreeImageAllocation(img, allocation)
+			}
+		}
+	} else {
+		// GPU may still be using this texture — defer destruction.
+		r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+			VulkanResourceTypeTexture,
+			[]interface{}{img, imageView, nil, allocation},
+		}
+	}
+}
+
+// TouchTexture updates the texture's last-used frame and promotes it back to
+// DEVICE_LOCAL if it was swapped out or residing in HOST_VISIBLE memory.
+// For evicted textures (needsReload=true), it recreates the texture from
+// hostBackingBuffer data, restoring GPU resources in-place.
+func (r *Renderer_VK) TouchTexture(t *Texture_VK) {
+	t.lastUsedFrame = r.currentFrameNumber
+
+	// Hard-evicted texture: recreate from hostBackingBuffer.
+	if t.needsReload && t.residency == ResidentEvicted && len(t.hostBackingBuffer) > 0 {
+		newTex, err := r.newTexture(t.width, t.height, t.depth, t.filter)
+		if err != nil {
+			LogMessage("[VRAM] TouchTexture reload failed for %dx%d texture: %v", t.width, t.height, err)
+			return
+		}
+		vkTex := newTex.(*Texture_VK)
+		vkTex.SetData(t.hostBackingBuffer)
+		// Transfer identity fields from the evicted texture.
+		vkTex.sampler = t.sampler
+		vkTex.offset = t.offset
+		vkTex.uvst = t.uvst
+		// Remove the new (temporary) texture from swappableTextures —
+		// it will be replaced by the evicted pointer after struct copy.
+		delete(r.swappableTextures, vkTex)
+		// Remove the evicted texture from swappableTextures (if still present).
+		delete(r.swappableTextures, t)
+		// Copy all fields of the new texture into the evicted struct.
+		// This preserves the pointer identity — all external references
+		// (e.g. Sprite.Tex holding *Texture_VK) see the updated state.
+		// After the copy, vkTex's fields are stale (pointing to resources
+		// now owned by t). Clear them to prevent the finalizer from
+		// double-freeing Vulkan resources.
+		vkTex.img = vk.NullImage
+		vkTex.imageView = vk.NullImageView
+		vkTex.sampler = vk.NullSampler
+		vkTex.allocation = nil
+		runtime.SetFinalizer(vkTex, nil)
+		*t = *vkTex
+		// Register the (now-restored) texture in swappableTextures.
+		if !t.nonSwappable {
+			r.swappableTextures[t] = true
+		}
+		return
+	}
+
+	if t.residency != ResidentDeviceLocal {
+		_ = r.SwapInTexture(t)
+	}
+}
+
+// TransitionToSwappedOut moves a texture from ResidentHostVisible to ResidentSwappedOut.
+// It copies the pixel data from the HOST_VISIBLE image into hostBackingBuffer,
+// then destroys the Vulkan resources.
+func (r *Renderer_VK) TransitionToSwappedOut(t *Texture_VK) error {
+	if t.residency != ResidentHostVisible {
+		return fmt.Errorf("TransitionToSwappedOut: texture is not in ResidentHostVisible state (current: %d)", t.residency)
+	}
+	if t.allocation == nil || !t.allocation.isHostVisible {
+		return fmt.Errorf("TransitionToSwappedOut: texture allocation is not host-visible")
+	}
+
+	// Calculate total data size
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	bytesPerPixel := vkFormatBytesPerPixel(format)
+	totalSize := int(t.width) * int(t.height) * int(bytesPerPixel)
+
+	// Get subresource layout for row pitch (LINEAR tiling images)
+	var subresourceLayout vk.SubresourceLayout
+	vk.GetImageSubresourceLayout(r.device, t.img, &vk.ImageSubresource{
+		AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit),
+		MipLevel:   0,
+		ArrayLayer: 0,
+	}, &subresourceLayout)
+
+	// Map host-visible memory
+	var data unsafe.Pointer
+	if err := vk.Error(vk.MapMemory(r.device, t.allocation.deviceMemory, t.allocation.offset, vk.DeviceSize(vk.WholeSize), 0, &data)); err != nil {
+		return fmt.Errorf("TransitionToSwappedOut: vk.MapMemory failed: %w", err)
+	}
+
+	// Allocate host backing buffer
+	t.hostBackingBuffer = make([]byte, totalSize)
+
+	// Copy row by row using the actual row pitch from the subresource layout
+	rowPitch := int(subresourceLayout.RowPitch)
+	srcPtr := uintptr(data)
+	for y := int32(0); y < t.height; y++ {
+		rowSize := int(t.width) * int(bytesPerPixel)
+		srcRow := unsafe.Slice((*byte)(unsafe.Pointer(srcPtr)), rowPitch)
+		dstOffset := int(y) * rowSize
+		copy(t.hostBackingBuffer[dstOffset:dstOffset+rowSize], srcRow[:rowSize])
+		srcPtr += uintptr(rowPitch)
+	}
+
+	// Unmap before freeing the allocation
+	vk.UnmapMemory(r.device, t.allocation.deviceMemory)
+
+	// Destroy Vulkan resources. If the texture hasn't been used in the last 2
+	// frames, the GPU is done — destroy immediately. Otherwise, defer.
+	r.destroyOrDeferImageResources(t.lastUsedFrame, t.img, t.imageView, t.allocation)
+
+	t.residency = ResidentSwappedOut
+	t.img = nil
+	t.imageView = nil
+	t.allocation = nil
+
+	return nil
+}
+
+// TransitionToDeviceLocal moves a texture back to device-local memory.
+// From ResidentSwappedOut: creates a new DEVICE_LOCAL image and uploads hostBackingBuffer data.
+// From ResidentHostVisible: creates a new DEVICE_LOCAL image and copies via vk.CmdCopyImage.
+func (r *Renderer_VK) TransitionToDeviceLocal(t *Texture_VK) error {
+	switch t.residency {
+	case ResidentSwappedOut:
+		return r.transitionSwappedOutToDeviceLocal(t)
+	case ResidentHostVisible:
+		return r.transitionHostVisibleToDeviceLocal(t)
+	default:
+		return fmt.Errorf("TransitionToDeviceLocal: texture is not in a swappable state (current: %d)", t.residency)
+	}
+}
+
+// transitionSwappedOutToDeviceLocal creates a new DEVICE_LOCAL image and uploads
+// data from hostBackingBuffer via staging buffer.
+func (r *Renderer_VK) transitionSwappedOutToDeviceLocal(t *Texture_VK) error {
+	if t.hostBackingBuffer == nil {
+		return fmt.Errorf("transitionSwappedOutToDeviceLocal: hostBackingBuffer is nil")
+	}
+
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	layerCount := uint32(1)
+	cube := false
+	usage := vk.ImageUsageFlags(vk.ImageUsageTransferSrcBit | vk.ImageUsageTransferDstBit | vk.ImageUsageSampledBit)
+
+	// Create new DEVICE_LOCAL image with OPTIMAL tiling
+	t.img = r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, layerCount, usage, 1, vk.ImageTilingOptimal, cube)
+
+	alloc, err := r.allocator.AllocateImageMemory(t.img, vk.MemoryPropertyDeviceLocalBit)
+	if err != nil {
+		vk.DestroyImage(r.device, t.img, nil)
+		t.img = nil
+		return fmt.Errorf("transitionSwappedOutToDeviceLocal: DEVICE_LOCAL allocation failed: %w", err)
+	}
+	t.allocation = alloc
+
+	// Upload hostBackingBuffer data via staging buffer and submit immediately.
+	// Swap-in is synchronous — the caller expects the texture to be ready after this call.
+	stagingOffset := r.CopyToStagingBuffer(uint32(len(t.hostBackingBuffer)), t.hostBackingBuffer)
+
+	r.poolMutex.Lock()
+	commandBuffer := r.BeginSingleTimeCommands()
+	r.poolMutex.Unlock()
+
+	// Transition image layout: Undefined → TransferDstOptimal
+	barrier := vk.ImageMemoryBarrier{
+		SType:               vk.StructureTypeImageMemoryBarrier,
+		OldLayout:           vk.ImageLayoutUndefined,
+		NewLayout:           vk.ImageLayoutTransferDstOptimal,
+		SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+		DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+		SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+		DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+		Image:               t.img,
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   0,
+			LevelCount:     t.mipLevels,
+			BaseArrayLayer: 0,
+			LayerCount:     layerCount,
+		},
+	}
+	vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, 1, []vk.ImageMemoryBarrier{barrier})
+
+	// Copy from staging buffer to image
+	copyRegion := vk.BufferImageCopy{
+		BufferOffset:      stagingOffset,
+		BufferRowLength:   0,
+		BufferImageHeight: 0,
+		ImageSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     layerCount,
+		},
+		ImageOffset: vk.Offset3D{X: 0, Y: 0, Z: 0},
+		ImageExtent: vk.Extent3D{
+			Width:  uint32(t.width),
+			Height: uint32(t.height),
+			Depth:  1,
+		},
+	}
+	vk.CmdCopyBufferToImage(commandBuffer, r.stagingBuffers[r.stagingBufferIndex].buffer, t.img, vk.ImageLayoutTransferDstOptimal, 1, []vk.BufferImageCopy{copyRegion})
+
+	// Transition to shader-read layout
+	barrier2 := vk.ImageMemoryBarrier{
+		SType:               vk.StructureTypeImageMemoryBarrier,
+		OldLayout:           vk.ImageLayoutTransferDstOptimal,
+		NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+		SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+		DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+		SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+		DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+		Image:               t.img,
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   0,
+			LevelCount:     t.mipLevels,
+			BaseArrayLayer: 0,
+			LayerCount:     layerCount,
+		},
+	}
+	vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, 1, []vk.ImageMemoryBarrier{barrier2})
+
+	r.poolMutex.Lock()
+	r.EndSingleTimeCommands(commandBuffer)
+	r.poolMutex.Unlock()
+
+	// Create image view
+	t.imageView = r.CreateImageView(t.img, format, 0, t.mipLevels, layerCount, cube)
+
+	// Free host backing buffer
+	t.hostBackingBuffer = nil
+
+	t.residency = ResidentDeviceLocal
+	return nil
+}
+
+// transitionHostVisibleToDeviceLocal creates a new DEVICE_LOCAL image and copies
+// data from the existing HOST_VISIBLE image via vk.CmdCopyImage.
+func (r *Renderer_VK) transitionHostVisibleToDeviceLocal(t *Texture_VK) error {
+	if t.allocation == nil || !t.allocation.isHostVisible {
+		return fmt.Errorf("transitionHostVisibleToDeviceLocal: texture allocation is not host-visible")
+	}
+
+	format := t.MapInternalFormat(Max(t.depth, 8))
+	layerCount := uint32(1)
+	cube := false
+	usage := vk.ImageUsageFlags(vk.ImageUsageTransferSrcBit | vk.ImageUsageTransferDstBit | vk.ImageUsageSampledBit)
+
+	// Create new DEVICE_LOCAL image with OPTIMAL tiling
+	newImg := r.CreateImage(uint32(t.width), uint32(t.height), format, t.mipLevels, layerCount, usage, 1, vk.ImageTilingOptimal, cube)
+
+	alloc, err := r.allocator.AllocateImageMemory(newImg, vk.MemoryPropertyDeviceLocalBit)
+	if err != nil {
+		vk.DestroyImage(r.device, newImg, nil)
+		return fmt.Errorf("transitionHostVisibleToDeviceLocal: DEVICE_LOCAL allocation failed: %w", err)
+	}
+
+	// Copy from HOST_VISIBLE to DEVICE_LOCAL via vk.CmdCopyImage
+	r.poolMutex.Lock()
+	commandBuffer := r.BeginSingleTimeCommands()
+	r.poolMutex.Unlock()
+
+	// Transition source (HOST_VISIBLE) to TransferSrcOptimal
+	// The HOST_VISIBLE image (LINEAR tiling) is in GENERAL layout after uploadHostVisibleData.
+	srcBarrier := vk.ImageMemoryBarrier{
+		SType:               vk.StructureTypeImageMemoryBarrier,
+		OldLayout:           vk.ImageLayoutGeneral,
+		NewLayout:           vk.ImageLayoutTransferSrcOptimal,
+		SrcAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+		DstAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+		SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+		DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+		Image:               t.img,
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   0,
+			LevelCount:     t.mipLevels,
+			BaseArrayLayer: 0,
+			LayerCount:     layerCount,
+		},
+	}
+
+	// Transition destination (DEVICE_LOCAL) to TransferDstOptimal
+	dstBarrier := vk.ImageMemoryBarrier{
+		SType:               vk.StructureTypeImageMemoryBarrier,
+		OldLayout:           vk.ImageLayoutUndefined,
+		NewLayout:           vk.ImageLayoutTransferDstOptimal,
+		SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+		DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+		SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+		DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+		Image:               newImg,
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   0,
+			LevelCount:     t.mipLevels,
+			BaseArrayLayer: 0,
+			LayerCount:     layerCount,
+		},
+	}
+
+	barriers := []vk.ImageMemoryBarrier{srcBarrier, dstBarrier}
+	vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+
+	// Copy image
+	region := vk.ImageCopy{
+		SrcSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     layerCount,
+		},
+		DstSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     layerCount,
+		},
+		SrcOffset: vk.Offset3D{X: 0, Y: 0, Z: 0},
+		DstOffset: vk.Offset3D{X: 0, Y: 0, Z: 0},
+		Extent: vk.Extent3D{
+			Width:  uint32(t.width),
+			Height: uint32(t.height),
+			Depth:  1,
+		},
+	}
+	vk.CmdCopyImage(commandBuffer, t.img, vk.ImageLayoutTransferSrcOptimal, newImg, vk.ImageLayoutTransferDstOptimal, 1, []vk.ImageCopy{region})
+
+	// Transition destination to shader-read layout
+	shaderBarrier := vk.ImageMemoryBarrier{
+		SType:               vk.StructureTypeImageMemoryBarrier,
+		OldLayout:           vk.ImageLayoutTransferDstOptimal,
+		NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+		SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+		DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+		SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+		DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+		Image:               newImg,
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   0,
+			LevelCount:     t.mipLevels,
+			BaseArrayLayer: 0,
+			LayerCount:     layerCount,
+		},
+	}
+	vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, 1, []vk.ImageMemoryBarrier{shaderBarrier})
+
+	r.poolMutex.Lock()
+	r.EndSingleTimeCommands(commandBuffer)
+	r.poolMutex.Unlock()
+
+	// Destroy old HOST_VISIBLE resources. If the texture hasn't been used in
+	// the last 2 frames, the GPU is done — destroy immediately. Otherwise, defer.
+	r.destroyOrDeferImageResources(t.lastUsedFrame, t.img, t.imageView, t.allocation)
+
+	// Create new image view
+	newImageView := r.CreateImageView(newImg, format, 0, t.mipLevels, layerCount, cube)
+
+	// Update texture fields
+	t.img = newImg
+	t.imageView = newImageView
+	t.allocation = alloc
+	t.residency = ResidentDeviceLocal
+
+	return nil
+}
+
+func (r *Renderer_VK) BeginFrame(clearColor bool) {
+	r.surfaceMutex.Lock()
+	if sys.window.renderingPaused || r.surfaceLost {
+		r.surfaceMutex.Unlock()
+		return
+	}
+	r.frameOpen = true
+	r.currentFrameNumber++
+
+	if !r.firstFrame {
+		vk.WaitForFences(r.device, 1, r.fences[:1], vk.True, 10*1000*1000*1000)
+	} else {
+		r.firstFrame = false
+	}
+	vk.ResetFences(r.device, 1, r.fences[:1])
+
+	// Query VRAM budget if VK_EXT_memory_budget is available.
+	if r.budgetEnabled {
+		memoryBudget := vk.PhysicalDeviceMemoryBudgetProperties{
+			SType: vk.StructureTypePhysicalDeviceMemoryBudgetProperties,
+		}
+		memProps2 := vk.PhysicalDeviceMemoryProperties2{
+			SType: vk.StructureTypePhysicalDeviceMemoryProperties2,
+			PNext: unsafe.Pointer(&memoryBudget),
+		}
+		vk.GetPhysicalDeviceMemoryProperties2(r.gpuDevices[r.gpuIndex], &memProps2)
+		r.memoryBudget = memoryBudget
+	}
+
+	// Check VRAM budget and trigger swap-out if needed.
+	r.CheckMemoryBudgetAndSwap()
+
+	r.destroyResourceQueueIndex = (r.destroyResourceQueueIndex + 1) % 2
+	if len(r.destroyResourceQueues[r.destroyResourceQueueIndex]) > 0 {
+		SafeGo(func() {
+			r.DestroyResources(len(r.destroyResourceQueues[r.destroyResourceQueueIndex]))
+		})
+	}
+	if len(r.usedCommands) > 0 {
+		if r.stagingBufferFences[0] {
+			vk.WaitForFences(r.device, 1, r.fences[1:2], vk.True, 10*1000*1000*1000)
+			vk.ResetFences(r.device, 1, r.fences[1:2])
+			r.stagingBufferFences[0] = false
+		}
+		if r.stagingBufferFences[1] {
+			vk.WaitForFences(r.device, 1, r.fences[2:3], vk.True, 10*1000*1000*1000)
+			vk.ResetFences(r.device, 1, r.fences[2:3])
+			r.stagingBufferFences[1] = false
+		}
+		r.poolMutex.Lock()
+		vk.FreeCommandBuffers(r.device, r.commandPools[0], uint32(len(r.usedCommands)), r.usedCommands)
+		r.poolMutex.Unlock()
+		r.usedCommands = r.usedCommands[:0]
+	}
+	if r.setVSync {
+		r.setVSync = false
+		r.RecreateSwapchain()
+	}
+	res := vk.AcquireNextImage(r.device, r.swapchains[0].swapchain,
+		vk.MaxUint64, r.semaphores[0], vk.NullFence, &r.swapchains[0].currentImageIndex)
+	if res != vk.Success {
+		if res == vk.ErrorOutOfDate || res == vk.Suboptimal {
+			if res == vk.Suboptimal && runtime.GOOS != "ios" && runtime.GOOS != "android" {
+				LogMessage("[INFO] recreate swapchain")
+				r.RecreateSwapchain()
+				res = vk.AcquireNextImage(r.device, r.swapchains[0].swapchain,
+					vk.MaxUint64, r.semaphores[0], vk.NullFence, &r.swapchains[0].currentImageIndex)
+				if res != vk.Success {
+					// Try continue execution if error is suboptimal
+					if res == vk.Suboptimal {
+						LogMessage("[WARNING] vk.AcquireNextImage returned suboptimal after swapchain recreation")
+						// We're probably on Android and can recreate this
+					} else if res == vk.ErrorSurfaceLost {
+						r.surfaceLost = true
+						return
+					} else {
+						err := fmt.Errorf("vk.AcquireNextImage failed with %s", vk.Error(res))
+						panic(err)
+					}
+				}
+			}
+		} else {
+			err := fmt.Errorf("vk.AcquireNextImage failed with %s", vk.Error(res))
+			panic(err)
+		}
+	}
+	vk.ResetCommandBuffer(r.commandBuffers[0], 0)
+	cmdBufferBeginInfo := vk.CommandBufferBeginInfo{
+		SType:            vk.StructureTypeCommandBufferBeginInfo,
+		Flags:            0,
+		PInheritanceInfo: nil,
+	}
+	// Fix Metal (MoltenVK) garbage init that can crash iOS
+	clearValues := []vk.ClearValue{
+		vk.NewClearValue([]float32{0.0, 0.0, 0.0, 1.0}), // Attachment 0: Color (RGBA)
+		vk.NewClearDepthStencil(1.0, 0),                 // Attachment 1: Depth (1.0) & Stencil (0)
+	}
+	renderPassBeginInfo := vk.RenderPassBeginInfo{
+		SType:       vk.StructureTypeRenderPassBeginInfo,
+		RenderPass:  r.mainRenderPass.renderPass,
+		Framebuffer: r.mainRenderTarget.framebuffer,
+		RenderArea: vk.Rect2D{
+			Offset: vk.Offset2D{
+				X: 0, Y: 0,
+			},
+			Extent: vk.Extent2D{
+				Width:  uint32(sys.scrrect[2]),
+				Height: uint32(sys.scrrect[3]),
+			},
+		},
+		ClearValueCount: uint32(len(clearValues)),
+		PClearValues:    clearValues,
+	}
+	err := vk.Error(vk.BeginCommandBuffer(r.commandBuffers[0], &cmdBufferBeginInfo))
+	if err != nil {
+		err = fmt.Errorf("vk.BeginCommandBuffer failed with %s", err)
+		panic(err)
+	}
+
+	imageMemoryBarrier := []vk.ImageMemoryBarrier{{
+		SType:         vk.StructureTypeImageMemoryBarrier,
+		DstAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+		OldLayout:     vk.ImageLayoutUndefined,
+		NewLayout:     vk.ImageLayoutColorAttachmentOptimal,
+		Image:         r.mainRenderTarget.texture.img,
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   0,
+			LevelCount:     1,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+	}}
+	vk.CmdPipelineBarrier(r.commandBuffers[0], vk.PipelineStageFlags(vk.PipelineStageBottomOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), 0, 0, nil, 0, nil, 1, imageMemoryBarrier)
+
+	vk.CmdBeginRenderPass(r.commandBuffers[0], &renderPassBeginInfo, vk.SubpassContentsInline)
+	if clearColor {
+		clearAttachments := []vk.ClearAttachment{
+			{
+				AspectMask:      vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				ColorAttachment: 0,
+				ClearValue:      vk.NewClearValue([]float32{0.0, 0.0, 0.0, 1}),
+			},
+			{
+				AspectMask: vk.ImageAspectFlags(vk.ImageAspectDepthBit),
+				ClearValue: vk.NewClearDepthStencil(1.0, 0),
+			},
+		}
+		vk.CmdClearAttachments(r.commandBuffers[0], uint32(len(clearAttachments)), clearAttachments, 1, []vk.ClearRect{{
+			Rect: vk.Rect2D{
+				Offset: vk.Offset2D{
+					X: 0, Y: 0,
+				},
+				Extent: vk.Extent2D{
+					Width:  uint32(sys.scrrect[2]),
+					Height: uint32(sys.scrrect[3]),
+				},
+			},
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		}})
+	}
+	r.renderShadowMap = false
+	r.VKState.currentProgram = nil
+	r.VKState.boundProgram = nil
+	r.vertexBufferOffset = 0
+	r.spriteProgram.uniformOffsetMap = make(map[interface{}]uint32)
+	r.spriteProgram.uniformBufferOffset = 0
+	r.currentSpriteTexture.spriteTexture = r.dummyTexture
+	r.currentSpriteTexture.palTexture = r.dummyTexture
+	r.currentSpriteTexture.customTex1 = nil
+	r.currentSpriteTexture.customTex2 = nil
+	r.VKState.spriteTexture = r.dummyTexture
+	r.VKState.palTexture = r.dummyTexture
+	r.VKState.customTex1 = nil
+	r.VKState.customTex2 = nil
+	if r.modelProgram != nil {
+		r.modelProgram.uniformOffsetMap = make(map[interface{}]uint32)
+		r.modelProgram.uniformBufferOffset = 0
+	}
+	// Fallback behavior
+	if !r.hasPushDescriptors {
+		r.poolMutex.Lock()
+		vk.ResetDescriptorPool(r.device, r.droidDescriptorPool, 0)
+		for program := range r.droidBindingState {
+			program.droidDescriptorSet = vk.NullDescriptorSet
+			delete(r.droidBindingState, program)
+		}
+		r.poolMutex.Unlock()
+	}
+}
+
+func (r *Renderer_VK) EndFrame() {
+	// prevent Activity wakeup crash (Android)
+	if !r.frameOpen {
+		return
+	}
+	if r.renderShadowMap {
+		r.waitGroup.Wait() // let the shadow map worker finish while the frame is still open
+	}
+	r.frameOpen = false
+	defer r.surfaceMutex.Unlock()
+	if len(r.stagingImageBarriers[0]) > 0 || len(r.tempCommands) > 0 {
+		r.FlushTempCommands()
+	}
+	vk.CmdEndRenderPass(r.commandBuffers[0])
+	imageMemoryBarrier := []vk.ImageMemoryBarrier{
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			SrcAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+			DstAccessMask: vk.AccessFlags(vk.AccessTransferReadBit),
+			OldLayout:     vk.ImageLayoutColorAttachmentOptimal,
+			NewLayout:     vk.ImageLayoutTransferSrcOptimal,
+			Image:         r.mainRenderTarget.texture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			SrcAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+			DstAccessMask: vk.AccessFlags(vk.AccessTransferWriteBit),
+			OldLayout:     vk.ImageLayoutUndefined,
+			NewLayout:     vk.ImageLayoutTransferDstOptimal,
+			Image:         r.renderTargets[0].texture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(r.commandBuffers[0], vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, uint32(len(imageMemoryBarrier)), imageMemoryBarrier)
+
+	if sys.msaa > 1 {
+		regions := []vk.ImageResolve{{
+			SrcSubresource: vk.ImageSubresourceLayers{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				MipLevel:       0,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+			Extent: vk.Extent3D{
+				Width:  uint32(r.mainRenderTarget.texture.width),
+				Height: uint32(r.mainRenderTarget.texture.height),
+				Depth:  1,
+			},
+			SrcOffset: vk.Offset3D{
+				X: 0,
+				Y: 0,
+				Z: 0,
+			},
+			DstSubresource: vk.ImageSubresourceLayers{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				MipLevel:       0,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+			DstOffset: vk.Offset3D{
+				X: 0,
+				Y: 0,
+				Z: 0,
+			},
+		}}
+		vk.CmdResolveImage(r.commandBuffers[0], r.mainRenderTarget.texture.img, vk.ImageLayoutTransferSrcOptimal, r.renderTargets[0].texture.img, vk.ImageLayoutTransferDstOptimal, 1, regions)
+	} else {
+		regions := []vk.ImageCopy{{
+			SrcSubresource: vk.ImageSubresourceLayers{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				MipLevel:       0,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+			SrcOffset: vk.Offset3D{
+				X: 0,
+				Y: 0,
+				Z: 0,
+			},
+			DstSubresource: vk.ImageSubresourceLayers{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				MipLevel:       0,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+			DstOffset: vk.Offset3D{
+				X: 0,
+				Y: 0,
+				Z: 0,
+			},
+			Extent: vk.Extent3D{
+				Width:  uint32(r.mainRenderTarget.texture.width),
+				Height: uint32(r.mainRenderTarget.texture.height),
+				Depth:  1,
+			},
+		}}
+		vk.CmdCopyImage(r.commandBuffers[0], r.mainRenderTarget.texture.img, vk.ImageLayoutTransferSrcOptimal, r.renderTargets[0].texture.img, vk.ImageLayoutTransferDstOptimal, 1, regions)
+	}
+
+	// Needed for iOS (MoltenVK) support
+	restoreBarrier := []vk.ImageMemoryBarrier{{
+		SType:         vk.StructureTypeImageMemoryBarrier,
+		SrcAccessMask: vk.AccessFlags(vk.AccessTransferReadBit),
+		DstAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+		OldLayout:     vk.ImageLayoutTransferSrcOptimal,
+		NewLayout:     vk.ImageLayoutColorAttachmentOptimal,
+		Image:         r.mainRenderTarget.texture.img,
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   0,
+			LevelCount:     1,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+	}}
+	vk.CmdPipelineBarrier(r.commandBuffers[0], vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), 0, 0, nil, 0, nil, 1, restoreBarrier)
+
+	imageMemoryBarrier = []vk.ImageMemoryBarrier{
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			SrcAccessMask: vk.AccessFlags(vk.AccessTransferWriteBit),
+			DstAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
+			OldLayout:     vk.ImageLayoutTransferDstOptimal,
+			NewLayout:     vk.ImageLayoutShaderReadOnlyOptimal,
+			Image:         r.renderTargets[0].texture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(r.commandBuffers[0], vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, 1, imageMemoryBarrier)
+
+	clearValues := []vk.ClearValue{vk.NewClearValue([]float32{0.0, 0.0, 0.0, 1})}
+	r.SetVertexData(-1, -1, 1, -1, -1, 1, 1, 1)
+	bufferIndex := int(r.vertexBufferOffset) / int(r.vertexBuffers[0].size)
+	if r.vertexBufferOffset > 0 && int(r.vertexBufferOffset)%int(r.vertexBuffers[0].size) == 0 {
+		bufferIndex -= 1
+	}
+	vk.CmdBindVertexBuffers(r.commandBuffers[0], 0, 1, []vk.Buffer{r.vertexBuffers[bufferIndex].buffer}, []vk.DeviceSize{0})
+
+	//TextureSize, CurrentTime
+	pushConstants := [3]float32{float32(r.renderTargets[0].texture.width), float32(r.renderTargets[0].texture.height), float32(sdl.GetPerformanceCounter())}
+	vk.CmdPushConstants(r.commandBuffers[0], r.postProcessingProgram.pipelineLayout, vk.ShaderStageFlags(vk.ShaderStageVertexBit|vk.ShaderStageFragmentBit), 0, 4*3, unsafe.Pointer(&pushConstants[0]))
+
+	for i := 0; i < len(r.postProcessingProgram.pipelines)-1; i++ {
+		renderPassBeginInfo := vk.RenderPassBeginInfo{
+			SType:       vk.StructureTypeRenderPassBeginInfo,
+			RenderPass:  r.postProcessingRenderPass.renderPass,
+			Framebuffer: r.renderTargets[(i+1)%2].framebuffer,
+			RenderArea: vk.Rect2D{
+				Offset: vk.Offset2D{
+					X: 0, Y: 0,
+				},
+				Extent: r.swapchains[0].extent,
+			},
+			ClearValueCount: 1,
+			PClearValues:    clearValues,
+		}
+		vk.CmdBeginRenderPass(r.commandBuffers[0], &renderPassBeginInfo, vk.SubpassContentsInline)
+		vk.CmdBindPipeline(r.commandBuffers[0], vk.PipelineBindPointGraphics, r.postProcessingProgram.pipelines[i])
+		vk.CmdBindDescriptorSets(r.commandBuffers[0], vk.PipelineBindPointGraphics, r.postProcessingProgram.pipelineLayout, 0, 1, []vk.DescriptorSet{r.renderTargets[i%2].descriptorSet}, 0, nil)
+		viewports := []vk.Viewport{{
+			MinDepth: 0.0,
+			MaxDepth: 1.0,
+			X:        0,
+			Y:        0,
+			Width:    float32(r.renderTargets[0].texture.width),
+			Height:   float32(r.renderTargets[0].texture.height),
+		}}
+		scissor := vk.Rect2D{
+			Offset: vk.Offset2D{
+				X: 0,
+				Y: 0,
+			},
+			Extent: vk.Extent2D{
+				Width:  uint32(r.renderTargets[0].texture.width),
+				Height: uint32(r.renderTargets[0].texture.height),
+			},
+		}
+		vk.CmdSetViewport(r.commandBuffers[0], 0, 1, viewports)
+		scissors := []vk.Rect2D{scissor}
+		vk.CmdSetScissor(r.commandBuffers[0], 0, 1, scissors)
+		vk.CmdDraw(r.commandBuffers[0], 4, 1, uint32(r.vertexBufferOffset%r.vertexBuffers[0].size)/8-4, 0)
+		vk.CmdEndRenderPass(r.commandBuffers[0])
+	}
+	renderPassBeginInfo := vk.RenderPassBeginInfo{
+		SType:       vk.StructureTypeRenderPassBeginInfo,
+		RenderPass:  r.swapchainRenderPass.renderPass,
+		Framebuffer: r.swapchains[0].framebuffers[r.swapchains[0].currentImageIndex],
+		RenderArea: vk.Rect2D{
+			Offset: vk.Offset2D{
+				X: 0, Y: 0,
+			},
+			Extent: r.swapchains[0].extent,
+		},
+		ClearValueCount: 1,
+		PClearValues:    clearValues,
+	}
+	vk.CmdBeginRenderPass(r.commandBuffers[0], &renderPassBeginInfo, vk.SubpassContentsInline)
+	vk.CmdBindPipeline(r.commandBuffers[0], vk.PipelineBindPointGraphics, r.postProcessingProgram.pipelines[len(r.postProcessingProgram.pipelines)-1])
+	vk.CmdBindDescriptorSets(r.commandBuffers[0], vk.PipelineBindPointGraphics, r.postProcessingProgram.pipelineLayout, 0, 1, []vk.DescriptorSet{r.renderTargets[(len(r.postProcessingProgram.pipelines)+1)%2].descriptorSet}, 0, nil)
+
+	x, y, width, height := sys.window.GetScaledViewportSize()
+	viewports := []vk.Viewport{{
+		MinDepth: 0.0,
+		MaxDepth: 1.0,
+		X:        float32(x),
+		Y:        float32(y),
+		Width:    float32(width),
+		Height:   float32(height),
+	}}
+	scissor := vk.Rect2D{
+		Offset: vk.Offset2D{
+			X: 0,
+			Y: 0,
+		},
+		Extent: r.swapchains[0].extent,
+	}
+	vk.CmdSetViewport(r.commandBuffers[0], 0, 1, viewports)
+	scissors := []vk.Rect2D{scissor}
+	vk.CmdSetScissor(r.commandBuffers[0], 0, 1, scissors)
+	vk.CmdDraw(r.commandBuffers[0], 4, 1, uint32(r.vertexBufferOffset%r.vertexBuffers[0].size)/8-4, 0)
+
+	vk.CmdEndRenderPass(r.commandBuffers[0])
+	vk.EndCommandBuffer(r.commandBuffers[0])
+
+	var submitCommands []vk.CommandBuffer
+	// Shadow rendering is typically done in another thread
+	if r.renderShadowMap && r.shadowCmdRecorded {
+		r.waitGroup.Wait() // wait for the shadow rendering to finish
+		submitCommands = []vk.CommandBuffer{r.commandBuffers[1], r.commandBuffers[0]}
+	} else {
+		if r.renderShadowMap {
+			r.waitGroup.Wait() // wait for the shadow rendering to finish
+		}
+		submitCommands = r.commandBuffers[:1]
+	}
+	r.shadowCmdRecorded = false
+
+	submitInfo := []vk.SubmitInfo{{
+		SType:                vk.StructureTypeSubmitInfo,
+		WaitSemaphoreCount:   1,
+		PWaitSemaphores:      r.semaphores[:1], // Image acquired semaphore
+		PWaitDstStageMask:    []vk.PipelineStageFlags{vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit)},
+		CommandBufferCount:   uint32(len(submitCommands)),
+		PCommandBuffers:      submitCommands,
+		PSignalSemaphores:    r.semaphores[r.swapchains[0].currentImageIndex+1 : r.swapchains[0].currentImageIndex+2], // Render done semaphore
+		SignalSemaphoreCount: 1,
+	}}
+
+	err := vk.Error(vk.QueueSubmit(r.queue, 1, submitInfo, r.fences[0]))
+	if err != nil {
+		err = fmt.Errorf("vk.QueueSubmit failed with %s", err)
+		panic(err)
+	}
+
+	imageIndices := []uint32{r.swapchains[0].currentImageIndex}
+	presentInfo := vk.PresentInfo{
+		SType:              vk.StructureTypePresentInfo,
+		WaitSemaphoreCount: 1,
+		PWaitSemaphores:    r.semaphores[r.swapchains[0].currentImageIndex+1 : r.swapchains[0].currentImageIndex+2], // Render done semaphore
+		SwapchainCount:     1,
+		PSwapchains:        []vk.Swapchain{r.swapchains[0].swapchain},
+		PImageIndices:      imageIndices,
+	}
+
+	res := vk.QueuePresent(r.queue, &presentInfo)
+	if res != vk.Success {
+		if res == vk.ErrorOutOfDate || res == vk.Suboptimal {
+			if res == vk.Suboptimal && (runtime.GOOS == "ios" || runtime.GOOS == "android") {
+				LogMessage("[INFO] suboptimal surface, ignoring")
+			} else {
+				LogMessage("[INFO] recreate swapchain")
+				r.RecreateSwapchain()
+			}
+		} else if res == vk.ErrorSurfaceLost {
+			r.surfaceLost = true
+		} else {
+			err := fmt.Errorf("vk.QueuePresent failed with %s", vk.Error(res))
+			panic(err)
+		}
+	}
+}
+
+func (r *Renderer_VK) PrintVkState() {
+	fmt.Printf("Number of Uniforms: %d \n", +len(r.spriteProgram.uniformOffsetMap))
+	fmt.Printf("Uniform Size: %d \n", +r.spriteProgram.uniformSize)
+	fmt.Printf("Uniform Alignment: %d \n", +r.minUniformBufferOffsetAlignment)
+
+	fmt.Printf("Vertex buffer offset: %d \n", +r.vertexBufferOffset)
+	return
+}
+
+func (r *Renderer_VK) Await() {
+	vk.QueueWaitIdle(r.queue)
+}
+
+func (r *Renderer_VK) SetPipeline() {
+	// Do nothing
+}
+
+// Vulkan doesn't really use these two at the moment
+func (r *Renderer_VK) EnableBlending(eq BlendEquation, src, dst BlendFunc) {
+	r.VKState.VulkanPipelineState.VulkanBlendState.op = eq
+	r.VKState.VulkanPipelineState.VulkanBlendState.src = src
+	r.VKState.VulkanPipelineState.VulkanBlendState.dst = dst
+}
+
+func (r *Renderer_VK) DisableBlending() {
+	r.VKState.VulkanBlendState.op = BlendAdd
+	r.VKState.VulkanBlendState.src = BlendSrcAlpha
+	r.VKState.VulkanBlendState.dst = BlendOneMinusSrcAlpha
+	// Same as old BlendReset()(
+}
+
+func (r *Renderer_VK) prepareShadowMapPipeline(bufferIndex uint32) {
+	// prevent Activity wakeup crash (Android)
+	if !r.frameOpen {
+		return
+	}
+	//r.renderShadowMap = true
+	vk.ResetCommandBuffer(r.commandBuffers[1], 0)
+	cmdBufferBeginInfo := vk.CommandBufferBeginInfo{
+		SType:            vk.StructureTypeCommandBufferBeginInfo,
+		Flags:            0,
+		PInheritanceInfo: nil,
+	}
+	vk.BeginCommandBuffer(r.commandBuffers[1], &cmdBufferBeginInfo)
+
+	barriers := []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutDepthStencilAttachmentOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessDepthStencilAttachmentWriteBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               r.shadowMapTextures.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectDepthBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     6 * 4,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(r.commandBuffers[1], vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageEarlyFragmentTestsBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+
+	depthAttachmentInfos := []vk.RenderingAttachmentInfo{{
+		SType:       vk.StructureTypeRenderingAttachmentInfo,
+		ImageView:   r.shadowMapTextures.imageView,
+		ImageLayout: vk.ImageLayoutDepthStencilAttachmentOptimal,
+		LoadOp:      vk.AttachmentLoadOpClear,
+		StoreOp:     vk.AttachmentStoreOpStore,
+		ClearValue:  vk.NewClearDepthStencil(1.0, 0),
+	}}
+	renderInfo := vk.RenderingInfo{
+		SType: vk.StructureTypeRenderingInfo,
+		RenderArea: vk.Rect2D{
+			Offset: vk.Offset2D{
+				X: 0, Y: 0,
+			},
+			Extent: vk.Extent2D{
+				Width:  uint32(r.shadowMapTextures.width),
+				Height: uint32(r.shadowMapTextures.height),
+			},
+		},
+		LayerCount:           6 * 4,
+		ColorAttachmentCount: 0,
+		PColorAttachments:    nil,
+		PDepthAttachment:     depthAttachmentInfos,
+	}
+	vk.CmdBeginRendering(r.commandBuffers[1], &renderInfo)
+	r.shadowPassActive = true
+
+	vk.CmdBindIndexBuffer(r.commandBuffers[1], r.modelIndexBuffers[bufferIndex].buffer, 0, vk.IndexTypeUint32)
+	r.VKState.modelVertexBufferIndex = bufferIndex
+
+	r.VKState.VulkanShadowMapTexture.tex = r.dummyTexture
+	r.VKState.VulkanShadowMapTexture.jointMatricesTexture = r.dummyTexture
+	r.VKState.VulkanShadowMapTexture.morphTargetTexture = r.dummyTexture
+
+	r.VKState.currentShadowMapTexture.tex = nil
+	r.VKState.currentShadowMapTexture.jointMatricesTexture = nil
+	r.VKState.currentShadowMapTexture.morphTargetTexture = nil
+	r.VKState.currentShadowmMapPipeline = nil
+	r.VKState.shadowMapUniformBufferOffset1 = 0
+	r.VKState.shadowMapUniformBufferOffset2 = 0
+
+	r.shadowMapProgram.uniformOffsetMap = make(map[interface{}]uint32)
+	r.shadowMapProgram.uniformBufferOffset = 0
+}
+func (r *Renderer_VK) setShadowMapPipeline(doubleSided, invertFrontFace, useUV, useNormal, useTangent, useVertColor, useJoint0, useJoint1 bool, numVertices, vertAttrOffset uint32) {
+	r.VKState.VulkanShadowMapPipelineState.doubleSided = doubleSided
+	r.VKState.VulkanShadowMapPipelineState.invertFrontFace = invertFrontFace
+	r.VKState.VulkanShadowMapPipelineState.useUV = useUV
+	r.VKState.VulkanShadowMapPipelineState.useNormal = useNormal
+	r.VKState.VulkanShadowMapPipelineState.useTangent = useTangent
+	r.VKState.VulkanShadowMapPipelineState.useVertColor = useVertColor
+	r.VKState.VulkanShadowMapPipelineState.useJoint0 = useJoint0
+	r.VKState.VulkanShadowMapPipelineState.useJoint1 = useJoint1
+	r.VKState.VulkanShadowMapPipelineState.useVertColor = useVertColor
+	r.VKState.shadowMapVertAttrOffset = vertAttrOffset
+}
+
+func (r *Renderer_VK) ReleaseShadowPipeline() {
+	defer r.waitGroup.Done()
+	if !r.shadowPassActive {
+		return
+	}
+	r.shadowPassActive = false
+	vk.CmdEndRendering(r.commandBuffers[1])
+	barriers := []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutDepthStencilAttachmentOptimal,
+			NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessDepthStencilAttachmentWriteBit),
+			DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               r.shadowMapTextures.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectDepthBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     6 * 4,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(r.commandBuffers[1], vk.PipelineStageFlags(vk.PipelineStageLateFragmentTestsBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+	vk.EndCommandBuffer(r.commandBuffers[1])
+	r.shadowCmdRecorded = true
+}
+func (r *Renderer_VK) prepareModelPipeline(bufferIndex uint32, env *Environment) {
+	// prevent Activity wakeup crash (Android)
+	if !r.frameOpen {
+		return
+	}
+	vk.CmdBindIndexBuffer(r.commandBuffers[0], r.modelIndexBuffers[bufferIndex].buffer, 0, vk.IndexTypeUint32)
+	r.VKState.modelVertexBufferIndex = bufferIndex
+	clearAttachments := []vk.ClearAttachment{
+		{
+			AspectMask: vk.ImageAspectFlags(vk.ImageAspectDepthBit),
+			ClearValue: vk.NewClearDepthStencil(1.0, 0),
+		},
+	}
+	vk.CmdClearAttachments(r.commandBuffers[0], uint32(len(clearAttachments)), clearAttachments, 1, []vk.ClearRect{{
+		Rect: vk.Rect2D{
+			Offset: vk.Offset2D{
+				X: 0, Y: 0,
+			},
+			Extent: vk.Extent2D{
+				Width:  uint32(sys.scrrect[2]),
+				Height: uint32(sys.scrrect[3]),
+			},
+		},
+		BaseArrayLayer: 0,
+		LayerCount:     1,
+	}})
+	if env != nil {
+		r.VKState.VulkanModelTexture.lambertianEnvSampler = env.lambertianTexture.tex.(*Texture_VK)
+		r.VKState.VulkanModelTexture.GGXEnvSampler = env.GGXTexture.tex.(*Texture_VK)
+		r.VKState.VulkanModelTexture.GGXLUT = env.GGXLUT.tex.(*Texture_VK)
+		r.VKState.environmentIntensity = env.environmentIntensity
+		r.VKState.mipCount = env.mipmapLevels
+		rotation := mgl.Rotate3DX(math.Pi).Mul3(mgl.Rotate3DY(0.5 * math.Pi))
+		r.Copy3x3Matrix(&r.VKState.environmentRotation, rotation[:])
+	} else {
+		r.VKState.environmentIntensity = 0
+		r.VKState.mipCount = 0
+		r.VKState.VulkanModelTexture.lambertianEnvSampler = r.dummyCubeTexture
+		r.VKState.VulkanModelTexture.GGXEnvSampler = r.dummyCubeTexture
+		r.VKState.VulkanModelTexture.GGXLUT = r.dummyTexture
+	}
+	r.VKState.VulkanModelTexture.tex = r.dummyTexture
+	r.VKState.VulkanModelTexture.normalMap = r.dummyNormalTexture // data alignment fix for mobile
+	r.VKState.VulkanModelTexture.metallicRoughnessMap = r.dummyTexture
+	r.VKState.VulkanModelTexture.ambientOcclusionMap = r.dummyWhiteTexture // data alignment fix for mobile
+	r.VKState.emissionMap = r.dummyTexture
+	r.VKState.VulkanModelTexture.jointMatricesTexture = r.dummyTexture
+	r.VKState.VulkanModelTexture.morphTargetTexture = r.dummyTexture
+
+	r.VKState.currentModelTexture.tex = nil
+	r.VKState.currentModelTexture.normalMap = nil
+	r.VKState.currentModelTexture.metallicRoughnessMap = nil
+	r.VKState.currentModelTexture.ambientOcclusionMap = nil
+	r.VKState.currentModelTexture.emissionMap = nil
+	r.VKState.currentModelTexture.jointMatricesTexture = nil
+	r.VKState.currentModelTexture.morphTargetTexture = nil
+}
+func (r *Renderer_VK) SetModelPipeline(eq BlendEquation, src, dst BlendFunc, depthTest, depthMask, doubleSided, invertFrontFace, useUV, useNormal, useTangent, useVertColor, useJoint0, useJoint1, useOutlineAttribute bool, numVertices, vertAttrOffset uint32) {
+	r.VKState.VulkanBlendState.op = eq
+	r.VKState.VulkanBlendState.src = src
+	r.VKState.VulkanBlendState.dst = dst
+	r.VKState.VulkanModelPipelineState.depthTest = depthTest
+	r.VKState.VulkanModelPipelineState.depthMask = depthMask
+	r.VKState.VulkanModelPipelineState.doubleSided = doubleSided
+	r.VKState.VulkanModelPipelineState.invertFrontFace = invertFrontFace
+	r.VKState.VulkanModelPipelineState.useUV = useUV
+	r.VKState.VulkanModelPipelineState.useNormal = useNormal
+	r.VKState.VulkanModelPipelineState.useTangent = useTangent
+	r.VKState.VulkanModelPipelineState.useVertColor = useVertColor
+	r.VKState.VulkanModelPipelineState.useJoint0 = useJoint0
+	r.VKState.VulkanModelPipelineState.useJoint1 = useJoint1
+	r.VKState.VulkanModelPipelineState.useOutlineAttribute = useOutlineAttribute
+	r.VKState.VulkanModelPipelineState.useVertColor = useVertColor
+	r.VKState.modelVertAttrOffset = vertAttrOffset
+}
+func (r *Renderer_VK) SetMeshOutlinePipeline(invertFrontFace bool, meshOutline float32) {
+	r.VKState.VulkanModelPipelineState.invertFrontFace = invertFrontFace
+	r.VKState.VulkanModelPipelineState.depthTest = true
+	r.VKState.VulkanModelPipelineState.depthMask = true
+	r.VKState.VulkanModelProgramUniformBufferObject2.meshOutline = meshOutline
+}
+func (r *Renderer_VK) ReleaseModelPipeline() {
+	//Do nothing
+}
+
+func (r *Renderer_VK) ReadPixels(data []uint8, width, height int) {
+	//Make sure the rendering is finished
+	//vk.WaitForFences(r.device, 1, r.fences[:1], vk.True, 10*1000*1000*1000)
+	vk.QueueWaitIdle(r.queue)
+	cmd := r.BeginSingleTimeCommands()
+
+	// Create intermediate image with optimal tiling for blitting
+	intermediateImg := r.CreateImage(uint32(width), uint32(height), vk.FormatR8g8b8a8Unorm, 1, 1, vk.ImageUsageFlags(vk.ImageUsageTransferDstBit|vk.ImageUsageTransferSrcBit), 1, vk.ImageTilingOptimal, false)
+
+	intermediateAlloc, err := r.allocator.AllocateImageMemory(intermediateImg, vk.MemoryPropertyDeviceLocalBit)
+	if err != nil {
+		fmt.Printf("ReadPixels: failed to allocate intermediate image memory: %v\n", err)
+		vk.DestroyImage(r.device, intermediateImg, nil)
+		return
+	}
+	// Create staging buffer
+	bufferSize := vk.DeviceSize(width * height * 4)
+	var stagingBufferMemory vk.DeviceMemory
+	stagingBuffer, err := r.CreateBuffer(bufferSize, vk.BufferUsageFlags(vk.BufferUsageTransferDstBit), vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit, &stagingBufferMemory)
+	if err != nil {
+		fmt.Printf("ReadPixels: failed to create staging buffer: %v\n", err)
+		vk.DestroyImage(r.device, intermediateImg, nil)
+		r.allocator.FreeImageAllocation(intermediateImg, intermediateAlloc)
+		return
+	}
+
+	// Transition source render target and intermediate image
+	imgBarriers := []vk.ImageMemoryBarrier{
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			OldLayout:     vk.ImageLayoutShaderReadOnlyOptimal,
+			NewLayout:     vk.ImageLayoutTransferSrcOptimal,
+			SrcAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
+			DstAccessMask: vk.AccessFlags(vk.AccessTransferReadBit),
+			Image:         r.renderTargets[(len(r.postProcessingProgram.pipelines)+1)%2].texture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			OldLayout:     vk.ImageLayoutUndefined,
+			NewLayout:     vk.ImageLayoutTransferDstOptimal,
+			SrcAccessMask: vk.AccessFlags(vk.AccessNone),
+			DstAccessMask: vk.AccessFlags(vk.AccessTransferWriteBit),
+			Image:         intermediateImg,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, 2, imgBarriers)
+
+	// Blit from render target to intermediate image
+	imageBlits := []vk.ImageBlit{{
+		SrcSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+		SrcOffsets: [2]vk.Offset3D{
+			{X: 0, Y: 0, Z: 0},
+			{X: int32(width), Y: int32(height), Z: 1},
+		},
+		DstSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+		DstOffsets: [2]vk.Offset3D{
+			{X: 0, Y: 0, Z: 0},
+			{X: int32(width), Y: int32(height), Z: 1},
+		},
+	}}
+	vk.CmdBlitImage(cmd, r.renderTargets[(len(r.postProcessingProgram.pipelines)+1)%2].texture.img, vk.ImageLayoutTransferSrcOptimal, intermediateImg, vk.ImageLayoutTransferDstOptimal, uint32(len(imageBlits)), imageBlits, vk.FilterNearest)
+
+	// Transition intermediate image for copying
+	imgBarriers = []vk.ImageMemoryBarrier{
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			OldLayout:     vk.ImageLayoutTransferDstOptimal,
+			NewLayout:     vk.ImageLayoutTransferSrcOptimal,
+			SrcAccessMask: vk.AccessFlags(vk.AccessTransferWriteBit),
+			DstAccessMask: vk.AccessFlags(vk.AccessTransferReadBit),
+			Image:         intermediateImg,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			OldLayout:     vk.ImageLayoutTransferSrcOptimal,
+			NewLayout:     vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask: vk.AccessFlags(vk.AccessTransferReadBit),
+			DstAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
+			Image:         r.renderTargets[(len(r.postProcessingProgram.pipelines)+1)%2].texture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit|vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, 2, imgBarriers)
+
+	// Copy from intermediate image to staging buffer
+	region := vk.BufferImageCopy{
+		BufferOffset:      0,
+		BufferRowLength:   0,
+		BufferImageHeight: 0,
+		ImageSubresource: vk.ImageSubresourceLayers{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			MipLevel:       0,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+		ImageOffset: vk.Offset3D{X: 0, Y: 0, Z: 0},
+		ImageExtent: vk.Extent3D{Width: uint32(width), Height: uint32(height), Depth: 1},
+	}
+	vk.CmdCopyImageToBuffer(cmd, intermediateImg, vk.ImageLayoutTransferSrcOptimal, stagingBuffer, 1, []vk.BufferImageCopy{region})
+
+	r.EndSingleTimeCommands(cmd)
+
+	// Map staging buffer and copy data
+	var mappedData unsafe.Pointer
+	vk.MapMemory(r.device, stagingBufferMemory, 0, bufferSize, 0, &mappedData)
+	imageData := (*[1 << 30]byte)(mappedData)
+	copy(data, imageData[:width*height*4])
+	vk.UnmapMemory(r.device, stagingBufferMemory)
+
+	// Cleanup
+	vk.DestroyBuffer(r.device, stagingBuffer, nil)
+	vk.FreeMemory(r.device, stagingBufferMemory, nil)
+	vk.DestroyImage(r.device, intermediateImg, nil)
+	r.allocator.FreeImageAllocation(intermediateImg, intermediateAlloc)
+}
+
+func (r *Renderer_VK) BeginScreenshot(width, height int) {
+	// Do nothing. Only GL needs this split
+}
+
+func (r *Renderer_VK) FinishScreenshot(data []uint8, width, height int) bool {
+	r.ReadPixels(data, width, height)
+	return true
+}
+
+func (r *Renderer_VK) EnableScissor(x, y, width, height int32) {
+	if x < 0 {
+		width += x
+		x = 0
+	}
+	if y < 0 {
+		height += y
+		y = 0
+	}
+	r.VKState.scissor = vk.Rect2D{
+		Offset: vk.Offset2D{
+			X: int32(x),
+			Y: int32(y),
+		},
+		Extent: vk.Extent2D{
+			Width:  uint32(width),
+			Height: uint32(height),
+		},
+	}
+}
+
+func (r *Renderer_VK) DisableScissor() {
+	r.VKState.scissor = vk.Rect2D{
+		Offset: vk.Offset2D{
+			X: 0,
+			Y: 0,
+		},
+		Extent: vk.Extent2D{
+			Width:  uint32(sys.scrrect[2]),
+			Height: uint32(sys.scrrect[3]),
+		},
+	}
+}
+func (r *Renderer_VK) Copy3x3Matrix(dst *[12]float32, src []float32) {
+	copy((*dst)[:3], src)
+	copy((*dst)[4:7], src[3:])
+	copy((*dst)[8:11], src[6:])
+}
+func (r *Renderer_VK) SetUniformMatrix(name string, value []float32) {
+	switch name {
+	case "modelview":
+		copy(r.VKState.VulkanSpriteProgramVertUniformBufferObject.modelView[:], value)
+	case "projection":
+		copy(r.VKState.VulkanSpriteProgramVertUniformBufferObject.projection[:], value)
+	}
+}
+
+func (r *Renderer_VK) SetUniformI(name string, value int) {
+	switch name {
+	case "isRgba":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.isRgba = uint32(value)
+	case "isTrapez":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.isTrapez = uint32(value)
+	case "isFlat":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.isFlat = uint32(value)
+	case "neg":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.neg = uint32(value)
+	case "mask":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.mask = int32(value)
+	}
+}
+
+func (r *Renderer_VK) SetUniformF(name string, values ...float32) {
+	switch name {
+	case "tint":
+		copy(r.VKState.VulkanSpriteProgramFragUniformBufferObject.tint[:], values)
+	case "x1x2x4x3":
+		copy(r.VKState.VulkanSpriteProgramFragUniformBufferObject.x1x2x4x3[:], values)
+	case "gray":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.gray = values[0]
+	case "hue":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.hue = values[0]
+	case "alpha":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.alpha = values[0]
+	case "iTime":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.iTime = values[0]
+	case "iResolution":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.iResolution[0] = values[0]
+		if len(values) > 1 {
+			r.VKState.VulkanSpriteProgramFragUniformBufferObject.iResolution[1] = values[1]
+		}
+	case "aspectRatio":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.aspectRatio = values[0]
+	case "sTime":
+		r.VKState.VulkanSpriteProgramFragUniformBufferObject.sTime = values[0]
+	}
+}
+
+func (r *Renderer_VK) SetUniformFv(name string, values []float32) {
+	switch name {
+	case "tint":
+		copy(r.VKState.VulkanSpriteProgramFragUniformBufferObject.tint[:], values)
+	case "add":
+		copy(r.VKState.VulkanSpriteProgramFragUniformBufferObject.add[:], values)
+	case "mult":
+		copy(r.VKState.VulkanSpriteProgramFragUniformBufferObject.mult[:], values)
+	}
+}
+
+func (r *Renderer_VK) SetTexture(name string, tex Texture) {
+	if tex == nil {
+		return
+	}
+	vkTex := tex.(*Texture_VK)
+	r.TouchTexture(vkTex)
+	if name == "tex" {
+		r.VKState.spriteTexture = vkTex
+	} else if name == "pal" {
+		r.VKState.palTexture = vkTex
+	} else if name == "tex1" {
+		if tex == nil {
+			r.VKState.customTex1 = nil
+			return
+		}
+		r.VKState.customTex1 = vkTex
+	} else if name == "tex2" {
+		if tex == nil {
+			r.VKState.customTex2 = nil
+			return
+		}
+		r.VKState.customTex2 = vkTex
+	}
+
+}
+
+func (r *Renderer_VK) SetModelUniformI(name string, val int) {
+	if len(name) > 7 && name[:7] == "lights[" {
+		lightIndex, _ := strconv.Atoi(name[7:8])
+		switch name[10:] {
+		case "type":
+			r.VKState.VulkanModelProgramUniformBufferObject0.lights[lightIndex].lightType = int32(val)
+			break
+		}
+	}
+	switch name {
+	case "numVertices":
+		r.VKState.VulkanModelProgramUniformBufferObject2.numVertices = uint32(val)
+		break
+	case "numTargets":
+		r.VKState.VulkanModelProgramUniformBufferObject2.numTargets = int32(val)
+		break
+	case "morphTargetTextureDimension":
+		r.VKState.VulkanModelProgramUniformBufferObject2.morphTargetTextureDimension = int32(val)
+		break
+	case "unlit":
+		r.VKState.VulkanModelProgramUniformBufferObject1.unlit = val != 0
+		break
+	case "neg":
+		if val != 0 {
+			r.VKState.VulkanModelProgramUniformBufferObject2.neg = 1
+		} else {
+			r.VKState.VulkanModelProgramUniformBufferObject2.neg = 0
+		}
+		break
+	case "enableAlpha":
+		r.VKState.VulkanModelProgramUniformBufferObject1.enableAlpha = val != 0
+		break
+	case "numJoints":
+		r.VulkanModelProgramUniformBufferObject2.numJoints = int32(val)
+		break
+	case "useTexture":
+		r.VKState.VulkanModelPipelineState.useTexture = val != 0
+		break
+	case "useNormalMap":
+		r.VKState.VulkanModelPipelineState.useNormalMap = val != 0
+		break
+	case "useMetallicRoughnessMap":
+		r.VKState.VulkanModelPipelineState.useMetallicRoughnessMap = val != 0
+		break
+	case "useEmissionMap":
+		r.VKState.VulkanModelPipelineState.useEmissionMap = val != 0
+		break
+	}
+}
+
+func (r *Renderer_VK) SetModelUniformF(name string, values ...float32) {
+	if len(name) > 7 && name[:7] == "lights[" {
+		lightIndex, _ := strconv.Atoi(name[7:8])
+		switch name[10:] {
+		case "color":
+			copy(r.VKState.VulkanModelProgramUniformBufferObject0.lights[lightIndex].color[:], values)
+			break
+		case "intensity":
+			r.VKState.VulkanModelProgramUniformBufferObject0.lights[lightIndex].intensity = values[0]
+			break
+		case "innerConeCos":
+			r.VKState.VulkanModelProgramUniformBufferObject0.lights[lightIndex].innerConeCos = values[0]
+			break
+		case "outerConeCos":
+			r.VKState.VulkanModelProgramUniformBufferObject0.lights[lightIndex].outerConeCos = values[0]
+			break
+		case "range":
+			r.VKState.VulkanModelProgramUniformBufferObject0.lights[lightIndex].lightRange = values[0]
+			break
+		case "position":
+			copy(r.VKState.VulkanModelProgramUniformBufferObject0.lights[lightIndex].position[:], values)
+			break
+		case "shadowMapFar":
+			r.VKState.VulkanModelProgramUniformBufferObject0.lights[lightIndex].shadowMapFar = values[0]
+			break
+		case "shadowBias":
+			r.VKState.VulkanModelProgramUniformBufferObject0.lights[lightIndex].shadowBias = values[0]
+			break
+		case "direction":
+			copy(r.VKState.VulkanModelProgramUniformBufferObject0.lights[lightIndex].direction[:], values)
+			break
+		}
+	} else {
+		switch name {
+		case "metallicRoughness":
+			copy(r.VKState.VulkanModelProgramUniformBufferObject1.metallicRoughness[:], values)
+			break
+		case "ambientOcclusionStrength":
+			r.VKState.VulkanModelProgramUniformBufferObject1.ambientOcclusionStrength = values[0]
+			break
+		case "cameraPosition":
+			copy(r.VKState.VulkanModelProgramUniformBufferObject0.cameraPosition[:], values)
+			break
+		case "morphTargetOffset":
+			copy(r.VKState.VulkanModelProgramUniformBufferObject2.morphTargetOffset[:], values)
+			break
+		case "gray":
+			r.VKState.VulkanModelProgramUniformBufferObject2.modelGray = values[0]
+		case "hue":
+			r.VKState.VulkanModelProgramUniformBufferObject2.modelHue = values[0]
+		case "alphaThreshold":
+			r.VKState.VulkanModelProgramUniformBufferObject1.alphaThreshold = values[0]
+		case "meshOutline":
+			r.VKState.VulkanModelProgramUniformBufferObject2.meshOutline = values[0]
+		}
+	}
+}
+func (r *Renderer_VK) SetModelUniformFv(name string, values []float32) {
+	switch name {
+	case "morphTargetWeight":
+		copy(r.VKState.VulkanModelProgramUniformBufferObject2.morphTargetWeight[0][:], values)
+		if len(values) > 4 {
+			copy(r.VKState.VulkanModelProgramUniformBufferObject2.morphTargetWeight[1][:], values[4:])
+		}
+		break
+	case "add":
+		copy(r.VKState.VulkanModelProgramUniformBufferObject2.modelAdd[:], values)
+		break
+	case "mult":
+		copy(r.VKState.VulkanModelProgramUniformBufferObject2.modelMult[:], values)
+		break
+	case "baseColorFactor":
+		copy(r.VKState.VulkanModelProgramUniformBufferObject1.baseColorFactor[:], values)
+		break
+	case "emission":
+		copy(r.VKState.VulkanModelProgramUniformBufferObject1.emission[:], values)
+		break
+	}
+}
+
+func (r *Renderer_VK) SetModelUniformMatrix(name string, values []float32) {
+	if len(name) > 14 && name[:14] == "lightMatrices[" {
+		lightIndex, _ := strconv.Atoi(name[14:15])
+		copy(r.VKState.VulkanModelProgramUniformBufferObject0.lightMatrices[lightIndex][:], values)
+	} else {
+		switch name {
+		case "model":
+			copy(r.VKState.VulkanModelProgramUniformBufferObject2.modelMatrix[:], values)
+		case "normalMatrix":
+			copy(r.VKState.VulkanModelProgramUniformBufferObject2.normalMatrix[:], values)
+		case "projection":
+			copy(r.VKState.VulkanModelProgramUniformBufferObject0.projectionMatrix[:], values)
+		case "view":
+			copy(r.VKState.VulkanModelProgramUniformBufferObject0.viewMatrix[:], values)
+		}
+	}
+}
+
+func (r *Renderer_VK) SetModelUniformMatrix3(name string, values []float32) {
+	switch name {
+	case "texTransform":
+		r.Copy3x3Matrix(&r.VKState.VulkanModelProgramUniformBufferObject1.texTransform, values)
+	case "normalMapTransform":
+		r.Copy3x3Matrix(&r.VKState.VulkanModelProgramUniformBufferObject1.normalMapTransform, values)
+	case "metallicRoughnessMapTransform":
+		r.Copy3x3Matrix(&r.VKState.VulkanModelProgramUniformBufferObject1.metallicRoughnessMapTransform, values)
+	case "ambientOcclusionMapTransform":
+		r.Copy3x3Matrix(&r.VKState.VulkanModelProgramUniformBufferObject1.ambientOcclusionMapTransform, values)
+	case "emissionMapTransform":
+		r.Copy3x3Matrix(&r.VKState.VulkanModelProgramUniformBufferObject1.emissionMapTransform, values)
+	}
+}
+
+func (r *Renderer_VK) SetModelTexture(name string, tex Texture) {
+	vkTex := tex.(*Texture_VK)
+	r.TouchTexture(vkTex)
+	switch name {
+	case "jointMatrices":
+		r.VKState.VulkanModelTexture.jointMatricesTexture = vkTex
+	case "morphTargetValues":
+		r.VKState.VulkanModelTexture.morphTargetTexture = vkTex
+	case "tex":
+		r.VKState.VulkanModelTexture.tex = vkTex
+	case "normalMap":
+		r.VKState.VulkanModelTexture.normalMap = vkTex
+	case "metallicRoughnessMap":
+		r.VKState.VulkanModelTexture.metallicRoughnessMap = vkTex
+	case "ambientOcclusionMap":
+		r.VKState.VulkanModelTexture.ambientOcclusionMap = vkTex
+	case "emissionMap":
+		r.VKState.VulkanModelTexture.emissionMap = vkTex
+	}
+}
+
+func (r *Renderer_VK) SetShadowMapUniformI(name string, val int) {
+	if len(name) > 7 && name[:7] == "lights[" {
+		lightIndex, _ := strconv.Atoi(name[7:8])
+		switch name[10:] {
+		case "type":
+			r.VKState.VulkanShadowMapProgramUniformBufferObject0.lights[lightIndex].lightType = int32(val)
+			break
+		}
+	}
+	switch name {
+	case "lightIndex":
+		r.VKState.VulkanShadowMapProgramPushConstant.lightIndex = int32(val)
+		break
+	case "numVertices":
+		r.VKState.VulkanShadowMapProgramPushConstant.numVertices = int32(val)
+		break
+	case "numTargets":
+		r.VKState.VulkanShadowMapProgramUniformBufferObject2.numTargets = int32(val)
+		break
+	case "morphTargetTextureDimension":
+		r.VKState.VulkanShadowMapProgramUniformBufferObject2.morphTargetTextureDimension = int32(val)
+		break
+	case "enableAlpha":
+		r.VKState.VulkanShadowMapProgramUniformBufferObject1.enableAlpha = val != 0
+		break
+	case "numJoints":
+		r.VulkanShadowMapProgramUniformBufferObject2.numJoints = int32(val)
+		break
+	case "useTexture":
+		r.VKState.VulkanShadowMapPipelineState.useTexture = val != 0
+		break
+	}
+}
+
+func (r *Renderer_VK) SetShadowMapUniformF(name string, values ...float32) {
+	if len(name) > 7 && name[:7] == "lights[" {
+		lightIndex, _ := strconv.Atoi(name[7:8])
+		switch name[10:] {
+		case "position":
+			copy(r.VKState.VulkanShadowMapProgramUniformBufferObject0.lights[lightIndex].position[:], values)
+			break
+		case "shadowMapFar":
+			r.VKState.VulkanShadowMapProgramUniformBufferObject0.lights[lightIndex].shadowMapFar = values[0]
+			break
+		}
+	} else {
+		switch name {
+		case "morphTargetOffset":
+			copy(r.VKState.VulkanShadowMapProgramUniformBufferObject2.morphTargetOffset[:], values)
+			break
+		case "alphaThreshold":
+			r.VKState.VulkanShadowMapProgramUniformBufferObject1.alphaThreshold = values[0]
+		}
+	}
+}
+func (r *Renderer_VK) SetShadowMapUniformFv(name string, values []float32) {
+	switch name {
+	case "morphTargetWeight":
+		copy(r.VKState.VulkanShadowMapProgramUniformBufferObject2.morphTargetWeight[0][:], values)
+		if len(values) > 4 {
+			copy(r.VKState.VulkanShadowMapProgramUniformBufferObject2.morphTargetWeight[1][:], values[4:])
+		}
+		break
+	case "baseColorFactor":
+		copy(r.VKState.VulkanShadowMapProgramUniformBufferObject1.baseColorFactor[:], values)
+		break
+	}
+}
+func (r *Renderer_VK) SetShadowMapUniformMatrix(name string, values []float32) {
+	if len(name) > 14 && name[:14] == "lightMatrices[" {
+		if name[15:16] == "]" {
+			lightIndex, _ := strconv.Atoi(name[14:15])
+			copy(r.VKState.VulkanShadowMapProgramUniformBufferObject0.lightMatrices[lightIndex][:], values)
+		} else {
+			lightIndex, _ := strconv.Atoi(name[14:16])
+			copy(r.VKState.VulkanShadowMapProgramUniformBufferObject0.lightMatrices[lightIndex][:], values)
+		}
+	} else {
+		switch name {
+		case "model":
+			copy(r.VKState.VulkanShadowMapProgramPushConstant.model[:], values)
+		}
+	}
+}
+
+func (r *Renderer_VK) SetShadowMapUniformMatrix3(name string, values []float32) {
+	switch name {
+	case "texTransform":
+		r.Copy3x3Matrix(&r.VKState.VulkanShadowMapProgramUniformBufferObject1.texTransform, values)
+		break
+	}
+}
+
+func (r *Renderer_VK) SetShadowMapTexture(name string, tex Texture) {
+	vkTex := tex.(*Texture_VK)
+	r.TouchTexture(vkTex)
+	switch name {
+	case "jointMatrices":
+		r.VKState.VulkanShadowMapTexture.jointMatricesTexture = vkTex
+	case "morphTargetValues":
+		r.VKState.VulkanShadowMapTexture.morphTargetTexture = vkTex
+	case "tex":
+		r.VKState.VulkanShadowMapTexture.tex = vkTex
+	}
+}
+
+func (r *Renderer_VK) SetShadowFrameTexture(i uint32) {
+	//Not used in Vulkan
+}
+
+func (r *Renderer_VK) SetShadowFrameCubeTexture(i uint32) {
+	//Not used in Vulkan
+}
+
+func (r *Renderer_VK) FlushDescriptors(programInfo *VulkanProgramInfo, cmd vk.CommandBuffer, descriptorWrites []vk.WriteDescriptorSet, switchedProgram bool) {
+	if len(descriptorWrites) == 0 && (!switchedProgram || r.hasPushDescriptors) {
+		return
+	}
+
+	// Fast Path: Push descriptors (PC/macOS/iOS/Supported Devices)
+	if r.hasPushDescriptors {
+		if len(descriptorWrites) > 0 {
+			vk.CmdPushDescriptorSet(cmd, vk.PipelineBindPointGraphics, programInfo.pipelineLayout, 0, uint32(len(descriptorWrites)), descriptorWrites)
+		}
+		return
+	}
+
+	// Fallback Path: Standard Descriptor Sets (Android Mali/Adreno)
+	r.poolMutex.Lock()
+	defer r.poolMutex.Unlock()
+
+	// Every binding needs to be written every frame in this setup
+	state := r.droidBindingState[programInfo]
+	if state == nil {
+		state = make(map[uint32]vk.WriteDescriptorSet)
+		r.droidBindingState[programInfo] = state
+	}
+	for _, w := range descriptorWrites {
+		state[w.DstBinding] = w
+	}
+
+	var set vk.DescriptorSet
+	// Allocate a persistent Descriptor Set for this program if one doesn't exist yet
+	allocInfo := vk.DescriptorSetAllocateInfo{
+		SType:              vk.StructureTypeDescriptorSetAllocateInfo,
+		DescriptorPool:     r.droidDescriptorPool,
+		DescriptorSetCount: 1,
+		PSetLayouts:        programInfo.descriptorSetLayouts,
+	}
+	if res := vk.AllocateDescriptorSets(r.device, &allocInfo, &set); res != vk.Success {
+		panic(fmt.Sprintf("Failed to allocate descriptor set: %v", res))
+	}
+	programInfo.droidDescriptorSet = set
+	fullWrites := make([]vk.WriteDescriptorSet, 0, len(state))
+	for _, w := range state {
+		w.DstSet = programInfo.droidDescriptorSet
+		fullWrites = append(fullWrites, w)
+	}
+	// If we have descriptor writes to push, apply them
+	if len(fullWrites) > 0 {
+		vk.UpdateDescriptorSets(r.device, uint32(len(fullWrites)), fullWrites, 0, nil)
+		// Bind the updated descriptor set to the active command buffer
+		vk.CmdBindDescriptorSets(cmd, vk.PipelineBindPointGraphics, programInfo.pipelineLayout, 0, 1, []vk.DescriptorSet{programInfo.droidDescriptorSet}, 0, nil)
+	}
+}
+
+func (r *Renderer_VK) SetVertexData(values ...float32) {
+	const m = 0x7fffffff
+	bufferIndex := int(r.vertexBufferOffset) / int(r.vertexBuffers[0].size)
+	offset := r.vertexBufferOffset % r.vertexBuffers[0].size
+	if (int(offset) + len(values)*4) > int(r.vertexBuffers[0].size) {
+		bufferIndex += 1
+		r.vertexBufferOffset = uintptr(bufferIndex * int(r.vertexBuffers[0].size))
+		offset = 0
+	}
+	if bufferIndex >= len(r.vertexBuffers) {
+		//allocate a new buffer
+		LogMessage("[INFO] allocate new vertex buffer")
+		var vertexBuffer VulkanBuffer
+		var vertexBufferMemory vk.DeviceMemory
+		var err error
+		vertexBuffer.size = r.vertexBuffers[0].size
+		vertexBuffer.buffer, err = r.CreateBuffer(vk.DeviceSize(vertexBuffer.size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageVertexBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &vertexBufferMemory)
+		if err != nil {
+			panic(err)
+		}
+		vertexBuffer.bufferMemory = vertexBufferMemory
+		var vertexData unsafe.Pointer
+		vk.MapMemory(r.device, vertexBuffer.bufferMemory, 0, vk.DeviceSize(vertexBuffer.size), 0, &vertexData)
+		vertexBuffer.data = vertexData
+		r.vertexBuffers = append(r.vertexBuffers, vertexBuffer)
+	}
+	if offset == 0 {
+		vk.CmdBindVertexBuffers(r.commandBuffers[0], 0, 1, []vk.Buffer{r.vertexBuffers[bufferIndex].buffer}, []vk.DeviceSize{0})
+	}
+	vk.Memcopy(unsafe.Pointer(uintptr(r.vertexBuffers[bufferIndex].data)+offset), (*[m]byte)(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&values)).Data))[:len(values)*4])
+	r.vertexBufferOffset += uintptr(len(values) * 4)
+}
+
+func (r *Renderer_VK) SetVertexData2(cmd vk.CommandBuffer, values ...float32) {
+	const m = 0x7fffffff
+	bufferIndex := int(r.vertexBufferOffset) / int(r.vertexBuffers[0].size)
+	offset := r.vertexBufferOffset % r.vertexBuffers[bufferIndex].size
+	if (int(offset) + len(values)*4) > int(r.vertexBuffers[0].size) {
+		bufferIndex += 1
+		r.vertexBufferOffset = uintptr(bufferIndex * int(r.vertexBuffers[0].size))
+		offset = 0
+	}
+	if bufferIndex >= len(r.vertexBuffers) {
+		//allocate a new buffer
+		LogMessage("[INFO] allocate new vertex buffer")
+		var vertexBuffer VulkanBuffer
+		var vertexBufferMemory vk.DeviceMemory
+		var err error
+		vertexBuffer.size = r.vertexBuffers[0].size
+		vertexBuffer.buffer, err = r.CreateBuffer(vk.DeviceSize(vertexBuffer.size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageVertexBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &vertexBufferMemory)
+		if err != nil {
+			panic(err)
+		}
+		vertexBuffer.bufferMemory = vertexBufferMemory
+		var vertexData unsafe.Pointer
+		vk.MapMemory(r.device, vertexBuffer.bufferMemory, 0, vk.DeviceSize(vertexBuffer.size), 0, &vertexData)
+		vertexBuffer.data = vertexData
+		r.vertexBuffers = append(r.vertexBuffers, vertexBuffer)
+	}
+	if offset == 0 {
+		vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{r.vertexBuffers[bufferIndex].buffer}, []vk.DeviceSize{0})
+	}
+	vk.Memcopy(unsafe.Pointer(uintptr(r.vertexBuffers[bufferIndex].data)+offset), (*[m]byte)(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&values)).Data))[:len(values)*4])
+	r.vertexBufferOffset += uintptr(len(values) * 4)
+}
+
+func (r *Renderer_VK) SetModelVertexData(bufferIndex uint32, values []byte) {
+	if r.modelVertexBuffers[bufferIndex].size >= 0 {
+		vk.DestroyBuffer(r.device, r.modelVertexBuffers[bufferIndex].buffer, nil)
+		vk.FreeMemory(r.device, r.modelVertexBuffers[bufferIndex].bufferMemory, nil)
+	}
+	r.modelVertexBuffers[bufferIndex].size = uintptr(len(values))
+	var bufferMemory vk.DeviceMemory
+	var err error
+	r.modelVertexBuffers[bufferIndex].buffer, err = r.CreateBuffer(vk.DeviceSize(r.modelVertexBuffers[bufferIndex].size), vk.BufferUsageFlags(vk.BufferUsageTransferDstBit|vk.BufferUsageVertexBufferBit), vk.MemoryPropertyDeviceLocalBit, &bufferMemory)
+	r.modelVertexBuffers[bufferIndex].bufferMemory = bufferMemory
+	if err != nil {
+		panic(err)
+	}
+	var stagingBufferMemory vk.DeviceMemory
+	var stagingBuffer vk.Buffer
+	stagingBuffer, err = r.CreateBuffer(vk.DeviceSize(len(values)), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &stagingBufferMemory)
+	if err != nil {
+		panic(err)
+	}
+	var stagingData unsafe.Pointer
+	vk.MapMemory(r.device, stagingBufferMemory, 0, vk.DeviceSize(len(values)), 0, &stagingData)
+	vk.Memcopy(stagingData, values)
+	r.poolMutex.Lock()
+	cmd := r.BeginSingleTimeCommands()
+	r.poolMutex.Unlock()
+	bufferCopy := []vk.BufferCopy{{
+		SrcOffset: 0,
+		DstOffset: 0,
+		Size:      vk.DeviceSize(len(values)),
+	}}
+	vk.CmdCopyBuffer(cmd, stagingBuffer, r.modelVertexBuffers[bufferIndex].buffer, 1, bufferCopy)
+	r.poolMutex.Lock()
+	r.EndSingleTimeCommands(cmd)
+	r.poolMutex.Unlock()
+	vk.UnmapMemory(r.device, stagingBufferMemory)
+	vk.DestroyBuffer(r.device, stagingBuffer, nil)
+	vk.FreeMemory(r.device, stagingBufferMemory, nil)
+}
+func (r *Renderer_VK) SetModelIndexData(bufferIndex uint32, values ...uint32) {
+	if r.modelIndexBuffers[bufferIndex].size >= 0 {
+		vk.DestroyBuffer(r.device, r.modelIndexBuffers[bufferIndex].buffer, nil)
+		vk.FreeMemory(r.device, r.modelIndexBuffers[bufferIndex].bufferMemory, nil)
+	}
+	r.modelIndexBuffers[bufferIndex].size = uintptr(len(values) * 4)
+	var bufferMemory vk.DeviceMemory
+	var err error
+	r.modelIndexBuffers[bufferIndex].buffer, err = r.CreateBuffer(vk.DeviceSize(r.modelIndexBuffers[bufferIndex].size), vk.BufferUsageFlags(vk.BufferUsageTransferDstBit|vk.BufferUsageIndexBufferBit), vk.MemoryPropertyDeviceLocalBit, &bufferMemory)
+	r.modelIndexBuffers[bufferIndex].bufferMemory = bufferMemory
+	if err != nil {
+		panic(err)
+	}
+	var stagingBufferMemory vk.DeviceMemory
+	var stagingBuffer vk.Buffer
+	stagingBuffer, err = r.CreateBuffer(vk.DeviceSize(r.modelIndexBuffers[bufferIndex].size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &stagingBufferMemory)
+	if err != nil {
+		panic(err)
+	}
+	var stagingData unsafe.Pointer
+	vk.MapMemory(r.device, stagingBufferMemory, 0, vk.DeviceSize(r.modelIndexBuffers[bufferIndex].size), 0, &stagingData)
+	const m = 0x7fffffff
+	vk.Memcopy(stagingData, (*[m]byte)(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&values)).Data))[:r.modelIndexBuffers[bufferIndex].size])
+	r.poolMutex.Lock()
+	cmd := r.BeginSingleTimeCommands()
+	r.poolMutex.Unlock()
+	bufferCopy := []vk.BufferCopy{{
+		SrcOffset: 0,
+		DstOffset: 0,
+		Size:      vk.DeviceSize(r.modelIndexBuffers[bufferIndex].size),
+	}}
+	vk.CmdCopyBuffer(cmd, stagingBuffer, r.modelIndexBuffers[bufferIndex].buffer, 1, bufferCopy)
+	r.poolMutex.Lock()
+	r.EndSingleTimeCommands(cmd)
+	r.poolMutex.Unlock()
+	vk.UnmapMemory(r.device, stagingBufferMemory)
+	vk.DestroyBuffer(r.device, stagingBuffer, nil)
+	vk.FreeMemory(r.device, stagingBufferMemory, nil)
+}
+
+func (r *Renderer_VK) RenderQuadSetup() uint32 {
+	targetProgram := r.VKState.currentProgram
+	if targetProgram == nil {
+		targetProgram = r.spriteProgram
+	}
+
+	switchedProgram := r.VKState.boundProgram != targetProgram
+	r.VKState.boundProgram = targetProgram
+
+	pipelineIndex, ok := targetProgram.pipelineIndexMap[r.VKState.VulkanPipelineState.VulkanBlendState]
+	if !ok {
+		panic("Pipeline not found")
+	}
+	pipeline := targetProgram.pipelines[pipelineIndex]
+	if switchedProgram || pipeline != r.VKState.currentPipeline {
+		r.VKState.currentPipeline = pipeline
+		vk.CmdBindPipeline(r.commandBuffers[0], vk.PipelineBindPointGraphics, pipeline)
+	}
+	if switchedProgram {
+		bufferIndex := int(r.vertexBufferOffset) / int(r.vertexBuffers[0].size)
+		if r.vertexBufferOffset > 0 && int(r.vertexBufferOffset)%int(r.vertexBuffers[0].size) == 0 {
+			bufferIndex -= 1
+		}
+		vk.CmdBindVertexBuffers(r.commandBuffers[0], 0, 1, []vk.Buffer{r.vertexBuffers[bufferIndex].buffer}, []vk.DeviceSize{0})
+	}
+
+	const m = 0x7fffffff
+	uniformBufferSize := uint32(targetProgram.uniformBuffers[0].size)
+
+	vertOffset, ok := targetProgram.uniformOffsetMap[r.VKState.VulkanSpriteProgramVertUniformBufferObject]
+	if !ok {
+		bufferIndex := targetProgram.uniformBufferOffset / uniformBufferSize
+		if int(bufferIndex) >= len(targetProgram.uniformBuffers) {
+			var uniformBuffer VulkanBuffer
+			var err error
+			uniformBuffer.size = targetProgram.uniformBuffers[0].size
+			uniformBuffer.buffer, err = r.CreateBuffer(vk.DeviceSize(uniformBuffer.size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageUniformBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &uniformBuffer.bufferMemory)
+			if err != nil {
+				panic(err)
+			}
+			vk.MapMemory(r.device, uniformBuffer.bufferMemory, 0, vk.DeviceSize(uniformBuffer.size), 0, &uniformBuffer.data)
+			targetProgram.uniformBuffers = append(targetProgram.uniformBuffers, uniformBuffer)
+		}
+		vertOffset = targetProgram.uniformBufferOffset
+		if targetProgram.uniformOffsetMap == nil {
+			targetProgram.uniformOffsetMap = make(map[interface{}]uint32)
+		}
+		targetProgram.uniformOffsetMap[r.VKState.VulkanSpriteProgramVertUniformBufferObject] = vertOffset
+		vk.Memcopy(unsafe.Pointer(uintptr(targetProgram.uniformBuffers[bufferIndex].data)+uintptr(vertOffset%uniformBufferSize)), (*[m]byte)(unsafe.Pointer(&r.VulkanSpriteProgramVertUniformBufferObject))[:VulkanVertUniformSize])
+		targetProgram.uniformBufferOffset += targetProgram.uniformSize
+	}
+
+	fragOffset, ok := targetProgram.uniformOffsetMap[r.VKState.VulkanSpriteProgramFragUniformBufferObject]
+	if !ok {
+		bufferIndex := targetProgram.uniformBufferOffset / uniformBufferSize
+		if int(bufferIndex) >= len(targetProgram.uniformBuffers) {
+			var uniformBuffer VulkanBuffer
+			var err error
+			uniformBuffer.size = targetProgram.uniformBuffers[0].size
+			uniformBuffer.buffer, err = r.CreateBuffer(vk.DeviceSize(uniformBuffer.size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageUniformBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &uniformBuffer.bufferMemory)
+			if err != nil {
+				panic(err)
+			}
+			vk.MapMemory(r.device, uniformBuffer.bufferMemory, 0, vk.DeviceSize(uniformBuffer.size), 0, &uniformBuffer.data)
+			targetProgram.uniformBuffers = append(targetProgram.uniformBuffers, uniformBuffer)
+		}
+		fragOffset = targetProgram.uniformBufferOffset
+		targetProgram.uniformOffsetMap[r.VKState.VulkanSpriteProgramFragUniformBufferObject] = fragOffset
+		vk.Memcopy(unsafe.Pointer(uintptr(targetProgram.uniformBuffers[bufferIndex].data)+uintptr(fragOffset%uniformBufferSize)), (*[m]byte)(unsafe.Pointer(&r.VulkanSpriteProgramFragUniformBufferObject))[:VulkanFragUniformSize])
+		targetProgram.uniformBufferOffset += targetProgram.uniformSize
+	}
+
+	descriptorWrites := make([]vk.WriteDescriptorSet, 0, 5)
+
+	if switchedProgram || vertOffset != r.VKState.spriteVertUniformBufferOffset {
+		r.VKState.spriteVertUniformBufferOffset = vertOffset
+		vertUniformInfo := []vk.DescriptorBufferInfo{{
+			Buffer: targetProgram.uniformBuffers[vertOffset/uniformBufferSize].buffer,
+			Offset: vk.DeviceSize(vertOffset % uniformBufferSize),
+			Range:  vk.DeviceSize(targetProgram.uniformSize),
+		}}
+		descriptorWrites = append(descriptorWrites, vk.WriteDescriptorSet{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstBinding:      0,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeUniformBuffer,
+			PBufferInfo:     vertUniformInfo,
+		})
+	}
+
+	if switchedProgram || fragOffset != r.VKState.spriteFragUniformBufferOffset {
+		r.VKState.spriteFragUniformBufferOffset = fragOffset
+		fragUniformInfo := []vk.DescriptorBufferInfo{{
+			Buffer: targetProgram.uniformBuffers[fragOffset/uniformBufferSize].buffer,
+			Offset: vk.DeviceSize(fragOffset % uniformBufferSize),
+			Range:  vk.DeviceSize(targetProgram.uniformSize),
+		}}
+		descriptorWrites = append(descriptorWrites, vk.WriteDescriptorSet{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstBinding:      1,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeUniformBuffer,
+			PBufferInfo:     fragUniformInfo,
+		})
+	}
+
+	if switchedProgram || r.VKState.spriteTexture != r.currentSpriteTexture.spriteTexture {
+		r.currentSpriteTexture.spriteTexture = r.VKState.spriteTexture
+		if r.VKState.spriteTexture.imageView == nil {
+			LogMessage("[WARN] imageView is nil!")
+		}
+		imageInfo := []vk.DescriptorImageInfo{
+			{
+				ImageLayout: r.VKState.spriteTexture.SampledLayout(),
+				ImageView:   r.VKState.spriteTexture.imageView,
+				Sampler:     r.spriteSamplers[0],
+			},
+		}
+		if r.spriteTexture.filter {
+			imageInfo[0].Sampler = r.spriteSamplers[1]
+		}
+		descriptorWrites = append(descriptorWrites, vk.WriteDescriptorSet{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstBinding:      2,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			PImageInfo:      imageInfo,
+		})
+	}
+
+	// MacOS and iOS MoltenVK workaround: push constants need to be set every draw call
+	if switchedProgram || r.VKState.palTexture != r.currentSpriteTexture.palTexture || r.shouldDoPerDrawPushDrawConstants {
+		if switchedProgram || r.VKState.palTexture.img != r.currentSpriteTexture.palTexture.img || r.VKState.palTexture.offset[0] != r.currentSpriteTexture.palTexture.offset[0] || r.VKState.palTexture.offset[1] != r.currentSpriteTexture.palTexture.offset[1] || r.shouldDoPerDrawPushDrawConstants {
+			uvst := r.VKState.palTexture.uvst
+			vk.CmdPushConstants(r.commandBuffers[0], targetProgram.pipelineLayout, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 16, unsafe.Pointer(&uvst))
+		}
+		if switchedProgram || r.VKState.palTexture.img != r.currentSpriteTexture.palTexture.img {
+			palImageInfo := []vk.DescriptorImageInfo{
+				{
+					ImageLayout: r.VKState.palTexture.SampledLayout(),
+					ImageView:   r.VKState.palTexture.imageView,
+					Sampler:     r.spriteSamplers[0],
+				},
+			}
+			descriptorWrites = append(descriptorWrites, vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      3,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo:      palImageInfo,
+			})
+		}
+		r.currentSpriteTexture.palTexture = r.VKState.palTexture
+	}
+
+	// Assign the texture (custom shader only)
+	if targetProgram != r.spriteProgram {
+		// --- Binding 4: GrabPass ---
+		texGrab := r.grabTexture
+		if texGrab == nil {
+			texGrab = r.dummyTexture
+		}
+		grabImageInfo := []vk.DescriptorImageInfo{
+			{
+				ImageLayout: texGrab.SampledLayout(),
+				ImageView:   texGrab.imageView,
+				Sampler:     r.spriteSamplers[0],
+			},
+		}
+		descriptorWrites = append(descriptorWrites, vk.WriteDescriptorSet{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstBinding:      4,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			PImageInfo:      grabImageInfo,
+		})
+
+		// --- Binding 5: tex1 ---
+		if switchedProgram || r.VKState.customTex1 != r.currentSpriteTexture.customTex1 {
+			r.currentSpriteTexture.customTex1 = r.VKState.customTex1
+
+			tex1 := r.VKState.customTex1
+			if tex1 == nil {
+				tex1 = r.dummyTexture // 未指定時はクラッシュ防止のためダミーを送る
+			}
+			imageInfo1 := []vk.DescriptorImageInfo{
+				{
+					ImageLayout: tex1.SampledLayout(),
+					ImageView:   tex1.imageView,
+					Sampler:     r.spriteSamplers[0],
+				},
+			}
+			if tex1.filter {
+				imageInfo1[0].Sampler = r.spriteSamplers[1]
+			}
+			descriptorWrites = append(descriptorWrites, vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      5,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo:      imageInfo1,
+			})
+		}
+
+		// --- Binding 6: tex2 ---
+		if switchedProgram || r.VKState.customTex2 != r.currentSpriteTexture.customTex2 {
+			r.currentSpriteTexture.customTex2 = r.VKState.customTex2
+
+			tex2 := r.VKState.customTex2
+			if tex2 == nil {
+				tex2 = r.dummyTexture
+			}
+			imageInfo2 := []vk.DescriptorImageInfo{
+				{
+					ImageLayout: tex2.SampledLayout(),
+					ImageView:   tex2.imageView,
+					Sampler:     r.spriteSamplers[0],
+				},
+			}
+			if tex2.filter {
+				imageInfo2[0].Sampler = r.spriteSamplers[1]
+			}
+			descriptorWrites = append(descriptorWrites, vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      6,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo:      imageInfo2,
+			})
+		}
+	}
+
+	if len(descriptorWrites) > 0 {
+		r.FlushDescriptors(targetProgram, r.commandBuffers[0], descriptorWrites, switchedProgram)
+	}
+
+	viewports := []vk.Viewport{{
+		MinDepth: 0.0,
+		MaxDepth: 1.0,
+		X:        0,
+		Y:        0,
+		Width:    float32(sys.scrrect[2]),
+		Height:   float32(sys.scrrect[3]),
+	}}
+	scissors := []vk.Rect2D{r.VKState.scissor}
+	vk.CmdSetViewport(r.commandBuffers[0], 0, 1, viewports)
+	vk.CmdSetScissor(r.commandBuffers[0], 0, 1, scissors)
+
+	//vk.CmdDraw(r.commandBuffers[0], 4, 1, uint32(r.vertexBufferOffset%r.vertexBuffers[0].size)/16-4, 0)
+	return uint32(r.vertexBufferOffset%r.vertexBuffers[0].size) / 16
+}
+
+func (r *Renderer_VK) RenderQuad() {
+	startVertex := r.RenderQuadSetup()
+	vk.CmdDraw(r.commandBuffers[0], 4, 1, startVertex-4, 0)
+}
+
+func (r *Renderer_VK) RenderQuadBatch(vertexCount int32) {
+	if vertexCount <= 0 {
+		return
+	}
+	startVertex := r.RenderQuadSetup()
+	vk.CmdDraw(r.commandBuffers[0], uint32(vertexCount), 1, startVertex-uint32(vertexCount), 0)
+}
+
+func (r *Renderer_VK) RenderElements(mode PrimitiveMode, count, offset int) {
+	// prevent Activity wakeup crash (Android)
+	if !r.frameOpen {
+		return
+	}
+	switchedProgram := r.VKState.boundProgram != r.modelProgram
+	r.VKState.boundProgram = r.modelProgram
+	r.VKState.currentProgram = r.modelProgram
+
+	r.VKState.VulkanModelPipelineState.primitiveMode = mode
+	pipeline := r.GetModelPipeline(&r.VKState.VulkanPipelineState)
+	if switchedProgram || pipeline != r.VKState.currentPipeline {
+		r.VKState.currentPipeline = pipeline
+		vk.CmdBindPipeline(r.commandBuffers[0], vk.PipelineBindPointGraphics, pipeline)
+	}
+	vertexBuffers := make([]vk.Buffer, 0, 3)
+	offsets := make([]vk.DeviceSize, 0, 3)
+	bufferOffset := r.VKState.modelVertAttrOffset
+	vertexAttributeUsage := []bool{true, true, r.VKState.VulkanModelPipelineState.useUV, r.VKState.VulkanModelPipelineState.useNormal, r.VKState.VulkanModelPipelineState.useTangent, r.VKState.VulkanModelPipelineState.useVertColor, r.VKState.VulkanModelPipelineState.useJoint0, r.VKState.VulkanModelPipelineState.useJoint0, r.VKState.VulkanModelPipelineState.useJoint1, r.VKState.VulkanModelPipelineState.useJoint1, r.VKState.VulkanModelPipelineState.useOutlineAttribute}
+	vertexAttributeOffsets := []uint32{1, 3, 2, 3, 4, 4, 4, 4, 4, 4, 4}
+	for i := 0; i < len(vertexAttributeOffsets); i++ {
+		if vertexAttributeUsage[i] {
+			vertexBuffers = append(vertexBuffers, r.modelVertexBuffers[r.VKState.modelVertexBufferIndex].buffer)
+			offsets = append(offsets, vk.DeviceSize(bufferOffset))
+			bufferOffset += uint32(r.VKState.VulkanModelProgramUniformBufferObject2.numVertices*4) * vertexAttributeOffsets[i]
+		}
+	}
+	const m = 0x7fffffff
+	vk.CmdBindVertexBuffers(r.commandBuffers[0], 0, uint32(len(vertexBuffers)), vertexBuffers, offsets)
+	descriptorWrites := make([]vk.WriteDescriptorSet, 0, 13)
+	if switchedProgram {
+		if len(r.modelProgram.uniformOffsetMap) == 0 {
+			vk.Memcopy(unsafe.Pointer(uintptr(r.modelProgram.uniformBuffers[0].data)), (*[m]byte)(unsafe.Pointer(&r.VKState.VulkanModelProgramUniformBufferObject0))[:VulkanModelUniform0Size])
+			r.modelProgram.uniformOffsetMap[r.VKState.VulkanModelProgramUniformBufferObject0] = 0
+			r.modelProgram.uniformBufferOffset += r.modelProgram.uniformSize
+		}
+		descriptorWrites = append(descriptorWrites,
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      0,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeUniformBuffer,
+				PBufferInfo: []vk.DescriptorBufferInfo{{
+					Buffer: r.modelProgram.uniformBuffers[0].buffer,
+					Offset: vk.DeviceSize(0),
+					Range:  vk.DeviceSize(r.modelProgram.uniformSize),
+				}},
+			},
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      5,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.VKState.lambertianEnvSampler.SampledLayout(),
+					ImageView:   r.VKState.lambertianEnvSampler.imageView,
+					Sampler:     r.VKState.lambertianEnvSampler.sampler,
+				}},
+			},
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      6,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.VKState.GGXEnvSampler.SampledLayout(),
+					ImageView:   r.VKState.GGXEnvSampler.imageView,
+					Sampler:     r.VKState.GGXEnvSampler.sampler,
+				}},
+			},
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      7,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.VKState.GGXLUT.SampledLayout(),
+					ImageView:   r.VKState.GGXLUT.imageView,
+					Sampler:     r.VKState.GGXLUT.sampler,
+				}},
+			},
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      13,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.shadowMapTextures.SampledLayout(),
+					ImageView:   r.shadowMapTextures.imageView,
+					Sampler:     r.shadowMapTextures.sampler,
+				}},
+			},
+		)
+	}
+	uniformBufferSize := uint32(r.modelProgram.uniformBuffers[0].size)
+	uniformOffset, ok := r.modelProgram.uniformOffsetMap[r.VKState.VulkanModelProgramUniformBufferObject1]
+	if !ok {
+		uniformOffset = r.modelProgram.uniformBufferOffset
+		if int(uniformOffset/uniformBufferSize) >= len(r.modelProgram.uniformBuffers) {
+			var uniformBuffer VulkanBuffer
+			var err error
+			uniformBuffer.size = r.modelProgram.uniformBuffers[0].size
+			uniformBuffer.buffer, err = r.CreateBuffer(vk.DeviceSize(uniformBuffer.size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageUniformBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &uniformBuffer.bufferMemory)
+			if err != nil {
+				panic(err)
+			}
+			vk.MapMemory(r.device, uniformBuffer.bufferMemory, 0, vk.DeviceSize(uniformBuffer.size), 0, &uniformBuffer.data)
+			r.modelProgram.uniformBuffers = append(r.modelProgram.uniformBuffers, uniformBuffer)
+		}
+		r.modelProgram.uniformOffsetMap[r.VKState.VulkanModelProgramUniformBufferObject1] = uniformOffset
+		vk.Memcopy(unsafe.Pointer(uintptr(r.modelProgram.uniformBuffers[uniformOffset/uniformBufferSize].data)+uintptr(uniformOffset%uniformBufferSize)), (*[m]byte)(unsafe.Pointer(&r.VulkanModelProgramUniformBufferObject1))[:VulkanModelUniform1Size])
+		r.modelProgram.uniformBufferOffset += r.modelProgram.uniformSize
+	}
+	if switchedProgram || r.VKState.modelUniformBufferOffset1 != uniformOffset {
+		descriptorWrites = append(descriptorWrites,
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      1,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeUniformBuffer,
+				PBufferInfo: []vk.DescriptorBufferInfo{{
+					Buffer: r.modelProgram.uniformBuffers[uniformOffset/uniformBufferSize].buffer,
+					Offset: vk.DeviceSize(uniformOffset % uniformBufferSize),
+					Range:  vk.DeviceSize(r.modelProgram.uniformSize),
+				}},
+			},
+		)
+		r.VKState.modelUniformBufferOffset1 = uniformOffset
+	}
+
+	uniformOffset2, ok := r.modelProgram.uniformOffsetMap[r.VKState.VulkanModelProgramUniformBufferObject2]
+	if !ok {
+		uniformOffset2 = r.modelProgram.uniformBufferOffset
+		if int(uniformOffset2/uniformBufferSize) >= len(r.modelProgram.uniformBuffers) {
+			var uniformBuffer VulkanBuffer
+			var err error
+			uniformBuffer.size = r.modelProgram.uniformBuffers[0].size
+			uniformBuffer.buffer, err = r.CreateBuffer(vk.DeviceSize(uniformBuffer.size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageUniformBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &uniformBuffer.bufferMemory)
+			if err != nil {
+				panic(err)
+			}
+			vk.MapMemory(r.device, uniformBuffer.bufferMemory, 0, vk.DeviceSize(uniformBuffer.size), 0, &uniformBuffer.data)
+			r.modelProgram.uniformBuffers = append(r.modelProgram.uniformBuffers, uniformBuffer)
+		}
+		r.modelProgram.uniformOffsetMap[r.VKState.VulkanModelProgramUniformBufferObject2] = uniformOffset2
+		vk.Memcopy(unsafe.Pointer(uintptr(r.modelProgram.uniformBuffers[uniformOffset2/uniformBufferSize].data)+uintptr(uniformOffset2%uniformBufferSize)), (*[m]byte)(unsafe.Pointer(&r.VulkanModelProgramUniformBufferObject2))[:VulkanModelUniform2Size])
+		r.modelProgram.uniformBufferOffset += r.modelProgram.uniformSize
+	}
+
+	if switchedProgram || r.VKState.modelUniformBufferOffset2 != uniformOffset2 {
+		descriptorWrites = append(descriptorWrites,
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      2,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeUniformBuffer,
+				PBufferInfo: []vk.DescriptorBufferInfo{{
+					Buffer: r.modelProgram.uniformBuffers[uniformOffset2/uniformBufferSize].buffer,
+					Offset: vk.DeviceSize(uniformOffset2 % uniformBufferSize),
+					Range:  vk.DeviceSize(r.modelProgram.uniformSize),
+				}},
+			},
+		)
+		r.VKState.modelUniformBufferOffset2 = uniformOffset2
+	}
+	if switchedProgram || r.VKState.currentModelTexture.jointMatricesTexture != r.VKState.VulkanModelTexture.jointMatricesTexture {
+		r.VKState.currentModelTexture.jointMatricesTexture = r.VKState.VulkanModelTexture.jointMatricesTexture
+		descriptorWrites = append(descriptorWrites,
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      3,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.VKState.VulkanModelTexture.jointMatricesTexture.SampledLayout(),
+					ImageView:   r.VKState.VulkanModelTexture.jointMatricesTexture.imageView,
+					Sampler:     r.VKState.VulkanModelTexture.jointMatricesTexture.sampler,
+				}},
+			},
+		)
+	}
+	if switchedProgram || r.VKState.currentModelTexture.morphTargetTexture != r.VKState.VulkanModelTexture.morphTargetTexture {
+		r.VKState.currentModelTexture.morphTargetTexture = r.VKState.VulkanModelTexture.morphTargetTexture
+		descriptorWrites = append(descriptorWrites,
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      4,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.VKState.VulkanModelTexture.morphTargetTexture.SampledLayout(),
+					ImageView:   r.VKState.VulkanModelTexture.morphTargetTexture.imageView,
+					Sampler:     r.VKState.VulkanModelTexture.morphTargetTexture.sampler,
+				}},
+			},
+		)
+	}
+	if switchedProgram || r.VKState.currentModelTexture.tex != r.VKState.VulkanModelTexture.tex {
+		r.VKState.currentModelTexture.tex = r.VKState.VulkanModelTexture.tex
+		descriptorWrites = append(descriptorWrites,
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      8,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.VKState.VulkanModelTexture.tex.SampledLayout(),
+					ImageView:   r.VKState.VulkanModelTexture.tex.imageView,
+					Sampler:     r.VKState.VulkanModelTexture.tex.sampler,
+				}},
+			},
+		)
+	}
+	if switchedProgram || r.VKState.currentModelTexture.normalMap != r.VKState.VulkanModelTexture.normalMap {
+		r.VKState.currentModelTexture.normalMap = r.VKState.VulkanModelTexture.normalMap
+		descriptorWrites = append(descriptorWrites,
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      9,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.VKState.VulkanModelTexture.normalMap.SampledLayout(),
+					ImageView:   r.VKState.VulkanModelTexture.normalMap.imageView,
+					Sampler:     r.VKState.VulkanModelTexture.normalMap.sampler,
+				}},
+			},
+		)
+	}
+	if switchedProgram || r.VKState.currentModelTexture.metallicRoughnessMap != r.VKState.VulkanModelTexture.metallicRoughnessMap {
+		r.VKState.currentModelTexture.metallicRoughnessMap = r.VKState.VulkanModelTexture.metallicRoughnessMap
+		descriptorWrites = append(descriptorWrites,
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      10,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.VKState.VulkanModelTexture.metallicRoughnessMap.SampledLayout(),
+					ImageView:   r.VKState.VulkanModelTexture.metallicRoughnessMap.imageView,
+					Sampler:     r.VKState.VulkanModelTexture.metallicRoughnessMap.sampler,
+				}},
+			},
+		)
+	}
+	if switchedProgram || r.VKState.currentModelTexture.ambientOcclusionMap != r.VKState.VulkanModelTexture.ambientOcclusionMap {
+		r.VKState.currentModelTexture.ambientOcclusionMap = r.VKState.ambientOcclusionMap
+		descriptorWrites = append(descriptorWrites,
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      11,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.VKState.VulkanModelTexture.ambientOcclusionMap.SampledLayout(),
+					ImageView:   r.VKState.VulkanModelTexture.ambientOcclusionMap.imageView,
+					Sampler:     r.VKState.VulkanModelTexture.ambientOcclusionMap.sampler,
+				}},
+			},
+		)
+	}
+	if switchedProgram || r.VKState.currentModelTexture.emissionMap != r.VKState.VulkanModelTexture.emissionMap {
+		r.VKState.currentModelTexture.emissionMap = r.VKState.emissionMap
+		descriptorWrites = append(descriptorWrites,
+			vk.WriteDescriptorSet{
+				SType:           vk.StructureTypeWriteDescriptorSet,
+				DstBinding:      12,
+				DstArrayElement: 0,
+				DescriptorCount: 1,
+				DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+				PImageInfo: []vk.DescriptorImageInfo{{
+					ImageLayout: r.VKState.VulkanModelTexture.emissionMap.SampledLayout(),
+					ImageView:   r.VKState.VulkanModelTexture.emissionMap.imageView,
+					Sampler:     r.VKState.VulkanModelTexture.emissionMap.sampler,
+				}},
+			},
+		)
+	}
+	if len(descriptorWrites) > 0 {
+		r.FlushDescriptors(r.modelProgram, r.commandBuffers[0], descriptorWrites, switchedProgram)
+	}
+	viewports := []vk.Viewport{{
+		MinDepth: 0.0,
+		MaxDepth: 1.0,
+		X:        0,
+		Y:        0,
+		Width:    float32(sys.scrrect[2]),
+		Height:   float32(sys.scrrect[3]),
+	}}
+	scissors := []vk.Rect2D{{
+		Offset: vk.Offset2D{
+			X: 0,
+			Y: 0,
+		},
+		Extent: vk.Extent2D{
+			Width:  uint32(sys.scrrect[2]),
+			Height: uint32(sys.scrrect[3]),
+		},
+	}}
+	vk.CmdSetViewport(r.commandBuffers[0], 0, 1, viewports)
+	vk.CmdSetScissor(r.commandBuffers[0], 0, 1, scissors)
+
+	vk.CmdDrawIndexed(r.commandBuffers[0], uint32(count), 1, uint32(offset/4), 0, 0)
+}
+
+func (r *Renderer_VK) RenderShadowMapElements(mode PrimitiveMode, count, offset int) {
+	// prevent Activity wakeup crash (Android)
+	if !r.frameOpen {
+		return
+	}
+	index := r.VKState.VulkanShadowMapProgramPushConstant.lightIndex
+	if index == 0 {
+		r.VKState.primitiveMode = mode
+		pipeline := r.GetShadowMapPipeline(&r.VKState.VulkanShadowMapPipelineState)
+		if pipeline != r.VKState.currentShadowmMapPipeline {
+			r.VKState.currentShadowmMapPipeline = pipeline
+			vk.CmdBindPipeline(r.commandBuffers[1], vk.PipelineBindPointGraphics, pipeline)
+		}
+
+		vertexBuffers := make([]vk.Buffer, 0, 3)
+		offsets := make([]vk.DeviceSize, 0, 3)
+		bufferOffset := r.VKState.shadowMapVertAttrOffset
+		vertexAttributeUsage := []bool{true, true, r.VKState.VulkanShadowMapPipelineState.useUV, r.VKState.VulkanShadowMapPipelineState.useNormal, r.VKState.VulkanShadowMapPipelineState.useTangent, r.VKState.VulkanShadowMapPipelineState.useVertColor, r.VKState.VulkanShadowMapPipelineState.useJoint0, r.VKState.VulkanShadowMapPipelineState.useJoint0, r.VKState.VulkanShadowMapPipelineState.useJoint1, r.VKState.VulkanShadowMapPipelineState.useJoint1, r.VKState.VulkanShadowMapPipelineState.useOutlineAttribute}
+		ActualVertexAttributeUsage := []bool{true, true, r.VKState.VulkanShadowMapPipelineState.useUV, false, false, r.VKState.VulkanShadowMapPipelineState.useVertColor, r.VKState.VulkanShadowMapPipelineState.useJoint0, r.VKState.VulkanShadowMapPipelineState.useJoint0, r.VKState.VulkanShadowMapPipelineState.useJoint1, r.VKState.VulkanShadowMapPipelineState.useJoint1, false}
+		vertexAttributeOffsets := []uint32{1, 3, 2, 3, 4, 4, 4, 4, 4, 4, 4}
+		for i := 0; i < len(vertexAttributeOffsets); i++ {
+			if vertexAttributeUsage[i] {
+				if !ActualVertexAttributeUsage[i] {
+					bufferOffset += uint32(r.VKState.VulkanShadowMapProgramPushConstant.numVertices*4) * vertexAttributeOffsets[i]
+					continue
+				}
+				vertexBuffers = append(vertexBuffers, r.modelVertexBuffers[r.VKState.modelVertexBufferIndex].buffer)
+				offsets = append(offsets, vk.DeviceSize(bufferOffset))
+				bufferOffset += uint32(r.VKState.VulkanShadowMapProgramPushConstant.numVertices*4) * vertexAttributeOffsets[i]
+			}
+		}
+		const m = 0x7fffffff
+		vk.CmdBindVertexBuffers(r.commandBuffers[1], 0, uint32(len(vertexBuffers)), vertexBuffers, offsets)
+		descriptorWrites := make([]vk.WriteDescriptorSet, 0, 13)
+		if len(r.shadowMapProgram.uniformOffsetMap) == 0 {
+			j := 0
+			for i := 0; i < 4; i++ {
+				if r.VKState.VulkanShadowMapProgramUniformBufferObject0.lights[i].lightType == 2 {
+					for k := 0; k < 6; k++ {
+						r.VKState.VulkanShadowMapProgramUniformBufferObject0.layers[j] = float32(i*6 + k)
+						j += 1
+					}
+				} else if r.VKState.VulkanShadowMapProgramUniformBufferObject0.lights[i].lightType != 0 {
+					r.VKState.VulkanShadowMapProgramUniformBufferObject0.layers[j] = float32(i * 6)
+					j += 1
+				}
+			}
+			r.VKState.numShadowMapLayers = uint32(j)
+			uniformSize := r.AlignUniformSize(uint32(VulkanShadowMapUniform0Size))
+			vk.Memcopy(unsafe.Pointer(uintptr(r.shadowMapProgram.uniformBuffers[0].data)), (*[m]byte)(unsafe.Pointer(&r.VKState.VulkanShadowMapProgramUniformBufferObject0))[:VulkanShadowMapUniform0Size])
+			r.shadowMapProgram.uniformOffsetMap[r.VKState.VulkanShadowMapProgramUniformBufferObject0] = 0
+			r.shadowMapProgram.uniformBufferOffset = uniformSize
+			descriptorWrites = append(descriptorWrites,
+				vk.WriteDescriptorSet{
+					SType:           vk.StructureTypeWriteDescriptorSet,
+					DstBinding:      0,
+					DstArrayElement: 0,
+					DescriptorCount: 1,
+					DescriptorType:  vk.DescriptorTypeUniformBuffer,
+					PBufferInfo: []vk.DescriptorBufferInfo{{
+						Buffer: r.shadowMapProgram.uniformBuffers[0].buffer,
+						Offset: vk.DeviceSize(0),
+						Range:  vk.DeviceSize(uniformSize),
+					}},
+				},
+			)
+
+		}
+		uniformBufferSize := uint32(r.shadowMapProgram.uniformBuffers[0].size)
+		uniformOffset, ok := r.shadowMapProgram.uniformOffsetMap[r.VKState.VulkanShadowMapProgramUniformBufferObject1]
+		if !ok {
+			uniformOffset = r.shadowMapProgram.uniformBufferOffset
+			if int(uniformOffset/uniformBufferSize) >= len(r.shadowMapProgram.uniformBuffers) || ((uniformOffset%uniformBufferSize)+r.shadowMapProgram.uniformSize) > uniformBufferSize {
+				r.shadowMapProgram.uniformBufferOffset = uint32(len(r.shadowMapProgram.uniformBuffers)) * uniformBufferSize
+				uniformOffset = r.shadowMapProgram.uniformBufferOffset
+				var uniformBuffer VulkanBuffer
+				var err error
+				uniformBuffer.size = r.shadowMapProgram.uniformBuffers[0].size
+				uniformBuffer.buffer, err = r.CreateBuffer(vk.DeviceSize(uniformBuffer.size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageUniformBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &uniformBuffer.bufferMemory)
+				if err != nil {
+					panic(err)
+				}
+				vk.MapMemory(r.device, uniformBuffer.bufferMemory, 0, vk.DeviceSize(uniformBuffer.size), 0, &uniformBuffer.data)
+				r.shadowMapProgram.uniformBuffers = append(r.shadowMapProgram.uniformBuffers, uniformBuffer)
+			}
+			r.shadowMapProgram.uniformOffsetMap[r.VKState.VulkanShadowMapProgramUniformBufferObject1] = uniformOffset
+			vk.Memcopy(unsafe.Pointer(uintptr(r.shadowMapProgram.uniformBuffers[r.shadowMapProgram.uniformBufferOffset/uniformBufferSize].data)+uintptr(uniformOffset%uniformBufferSize)), (*[m]byte)(unsafe.Pointer(&r.VKState.VulkanShadowMapProgramUniformBufferObject1))[:VulkanShadowMapUniform1Size])
+			r.shadowMapProgram.uniformBufferOffset += r.shadowMapProgram.uniformSize
+		}
+		if r.VKState.shadowMapUniformBufferOffset1 != uniformOffset {
+			descriptorWrites = append(descriptorWrites,
+				vk.WriteDescriptorSet{
+					SType:           vk.StructureTypeWriteDescriptorSet,
+					DstBinding:      1,
+					DstArrayElement: 0,
+					DescriptorCount: 1,
+					DescriptorType:  vk.DescriptorTypeUniformBuffer,
+					PBufferInfo: []vk.DescriptorBufferInfo{{
+						Buffer: r.shadowMapProgram.uniformBuffers[uniformOffset/uniformBufferSize].buffer,
+						Offset: vk.DeviceSize(uniformOffset % uniformBufferSize),
+						Range:  vk.DeviceSize(r.shadowMapProgram.uniformSize),
+					}},
+				},
+			)
+			r.VKState.shadowMapUniformBufferOffset1 = uniformOffset
+		}
+
+		uniformOffset2, ok := r.shadowMapProgram.uniformOffsetMap[r.VKState.VulkanShadowMapProgramUniformBufferObject2]
+		if !ok {
+			uniformOffset2 = r.shadowMapProgram.uniformBufferOffset
+			if int(uniformOffset2/uniformBufferSize) >= len(r.shadowMapProgram.uniformBuffers) || ((uniformOffset%uniformBufferSize)+r.shadowMapProgram.uniformSize) > uniformBufferSize {
+				r.shadowMapProgram.uniformBufferOffset = uint32(len(r.shadowMapProgram.uniformBuffers)) * uniformBufferSize
+				uniformOffset = r.shadowMapProgram.uniformBufferOffset
+				var uniformBuffer VulkanBuffer
+				var err error
+				uniformBuffer.size = r.shadowMapProgram.uniformBuffers[0].size
+				uniformBuffer.buffer, err = r.CreateBuffer(vk.DeviceSize(uniformBuffer.size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageUniformBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &uniformBuffer.bufferMemory)
+				if err != nil {
+					panic(err)
+				}
+				vk.MapMemory(r.device, uniformBuffer.bufferMemory, 0, vk.DeviceSize(uniformBuffer.size), 0, &uniformBuffer.data)
+				r.shadowMapProgram.uniformBuffers = append(r.shadowMapProgram.uniformBuffers, uniformBuffer)
+			}
+			r.shadowMapProgram.uniformOffsetMap[r.VKState.VulkanShadowMapProgramUniformBufferObject2] = uniformOffset2
+			vk.Memcopy(unsafe.Pointer(uintptr(r.shadowMapProgram.uniformBuffers[r.shadowMapProgram.uniformBufferOffset/uniformBufferSize].data)+uintptr(uniformOffset2%uniformBufferSize)), (*[m]byte)(unsafe.Pointer(&r.VKState.VulkanShadowMapProgramUniformBufferObject2))[:VulkanShadowMapUniform2Size])
+			r.shadowMapProgram.uniformBufferOffset += r.shadowMapProgram.uniformSize
+		}
+
+		if r.VKState.shadowMapUniformBufferOffset2 != uniformOffset2 {
+			descriptorWrites = append(descriptorWrites,
+				vk.WriteDescriptorSet{
+					SType:           vk.StructureTypeWriteDescriptorSet,
+					DstBinding:      2,
+					DstArrayElement: 0,
+					DescriptorCount: 1,
+					DescriptorType:  vk.DescriptorTypeUniformBuffer,
+					PBufferInfo: []vk.DescriptorBufferInfo{{
+						Buffer: r.shadowMapProgram.uniformBuffers[uniformOffset2/uniformBufferSize].buffer,
+						Offset: vk.DeviceSize(uniformOffset2 % uniformBufferSize),
+						Range:  vk.DeviceSize(r.shadowMapProgram.uniformSize),
+					}},
+				},
+			)
+			r.VKState.shadowMapUniformBufferOffset2 = uniformOffset2
+		}
+		if r.VKState.currentShadowMapTexture.jointMatricesTexture != r.VKState.VulkanShadowMapTexture.jointMatricesTexture {
+			r.VKState.currentShadowMapTexture.jointMatricesTexture = r.VKState.VulkanShadowMapTexture.jointMatricesTexture
+			descriptorWrites = append(descriptorWrites,
+				vk.WriteDescriptorSet{
+					SType:           vk.StructureTypeWriteDescriptorSet,
+					DstBinding:      3,
+					DstArrayElement: 0,
+					DescriptorCount: 1,
+					DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+					PImageInfo: []vk.DescriptorImageInfo{{
+						ImageLayout: r.VKState.VulkanShadowMapTexture.jointMatricesTexture.SampledLayout(),
+						ImageView:   r.VKState.VulkanShadowMapTexture.jointMatricesTexture.imageView,
+						Sampler:     r.VKState.VulkanShadowMapTexture.jointMatricesTexture.sampler,
+					}},
+				},
+			)
+		}
+		if r.VKState.currentShadowMapTexture.morphTargetTexture != r.VKState.VulkanShadowMapTexture.morphTargetTexture {
+			r.VKState.currentShadowMapTexture.morphTargetTexture = r.VKState.VulkanShadowMapTexture.morphTargetTexture
+			descriptorWrites = append(descriptorWrites,
+				vk.WriteDescriptorSet{
+					SType:           vk.StructureTypeWriteDescriptorSet,
+					DstBinding:      4,
+					DstArrayElement: 0,
+					DescriptorCount: 1,
+					DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+					PImageInfo: []vk.DescriptorImageInfo{{
+						ImageLayout: r.VKState.VulkanShadowMapTexture.morphTargetTexture.SampledLayout(),
+						ImageView:   r.VKState.VulkanShadowMapTexture.morphTargetTexture.imageView,
+						Sampler:     r.VKState.VulkanShadowMapTexture.morphTargetTexture.sampler,
+					}},
+				},
+			)
+		}
+		if r.VKState.currentShadowMapTexture.tex != r.VKState.VulkanShadowMapTexture.tex {
+			r.VKState.currentShadowMapTexture.tex = r.VKState.VulkanShadowMapTexture.tex
+			descriptorWrites = append(descriptorWrites,
+				vk.WriteDescriptorSet{
+					SType:           vk.StructureTypeWriteDescriptorSet,
+					DstBinding:      5,
+					DstArrayElement: 0,
+					DescriptorCount: 1,
+					DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+					PImageInfo: []vk.DescriptorImageInfo{{
+						ImageLayout: r.VKState.VulkanShadowMapTexture.tex.SampledLayout(),
+						ImageView:   r.VKState.VulkanShadowMapTexture.tex.imageView,
+						Sampler:     r.VKState.VulkanShadowMapTexture.tex.sampler,
+					}},
+				},
+			)
+		}
+		if len(descriptorWrites) > 0 {
+			r.FlushDescriptors(r.shadowMapProgram, r.commandBuffers[1], descriptorWrites, true)
+		}
+		vertConstants := r.VKState.VulkanShadowMapProgramPushConstant
+		vk.CmdPushConstants(r.commandBuffers[1], r.shadowMapProgram.pipelineLayout, vk.ShaderStageFlags(vk.ShaderStageVertexBit), 0, 68, unsafe.Pointer(&vertConstants))
+		vk.CmdDrawIndexed(r.commandBuffers[1], uint32(count), r.VKState.numShadowMapLayers, uint32(offset/4), 0, 0)
+	}
+}
+
+func (r *Renderer_VK) RenderCubeMap(envTex Texture, cubeTex Texture) {
+	if len(r.stagingImageBarriers[0]) > 0 || len(r.tempCommands) > 0 {
+		r.FlushTempCommands()
+	}
+	envTexture := envTex.(*Texture_VK)
+	cubeTexture := cubeTex.(*Texture_VK)
+	textureSize := cubeTexture.width
+	r.vertexBufferOffset = 0
+
+	r.poolMutex.Lock()
+	cmd := r.BeginSingleTimeCommands()
+	r.poolMutex.Unlock()
+	barriers := []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutColorAttachmentOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               cubeTexture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     6,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+
+	colorAttachmentInfos := []vk.RenderingAttachmentInfo{{
+		SType:       vk.StructureTypeRenderingAttachmentInfo,
+		ImageView:   cubeTexture.imageView,
+		ImageLayout: vk.ImageLayoutAttachmentOptimal,
+		LoadOp:      vk.AttachmentLoadOpClear,
+		StoreOp:     vk.AttachmentStoreOpStore,
+		ClearValue:  vk.NewClearValue([]float32{0.0, 0.0, 0.0, 1}),
+	}}
+	renderInfo := vk.RenderingInfo{
+		SType: vk.StructureTypeRenderingInfo,
+		RenderArea: vk.Rect2D{
+			Offset: vk.Offset2D{
+				X: 0, Y: 0,
+			},
+			Extent: vk.Extent2D{
+				Width:  uint32(textureSize),
+				Height: uint32(textureSize),
+			},
+		},
+		LayerCount:           6,
+		ViewMask:             0b00111111,
+		ColorAttachmentCount: 1,
+		PColorAttachments:    colorAttachmentInfos,
+	}
+	vk.CmdBeginRendering(cmd, &renderInfo)
+	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, r.panoramaToCubeMapProgram.pipelines[0])
+
+	vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{r.vertexBuffers[0].buffer}, []vk.DeviceSize{0})
+	r.SetVertexData2(cmd, -1, -1, 1, -1, -1, 1, 1, 1)
+
+	imageInfo := [][]vk.DescriptorImageInfo{
+		{{
+			ImageLayout: envTexture.SampledLayout(),
+			ImageView:   envTexture.imageView,
+			Sampler:     envTexture.sampler,
+		}},
+	}
+	descriptorWrites := []vk.WriteDescriptorSet{
+		{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstSet:          nil,
+			DstBinding:      0,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			PImageInfo:      imageInfo[0],
+		},
+	}
+	r.FlushDescriptors(r.panoramaToCubeMapProgram, cmd, descriptorWrites, true)
+
+	viewports := []vk.Viewport{{
+		MinDepth: 0.0,
+		MaxDepth: 1.0,
+		X:        0.0,
+		Y:        0.0,
+		Width:    float32(cubeTexture.width),
+		Height:   float32(cubeTexture.width),
+	}}
+	scissor := vk.Rect2D{
+		Offset: vk.Offset2D{
+			X: 0,
+			Y: 0,
+		},
+		Extent: vk.Extent2D{
+			Width:  uint32(textureSize),
+			Height: uint32(textureSize),
+		},
+	}
+	vk.CmdSetViewport(cmd, 0, 1, viewports)
+	scissors := []vk.Rect2D{scissor}
+	vk.CmdSetScissor(cmd, 0, 1, scissors)
+
+	vk.CmdDraw(cmd, 4, 1, uint32(r.vertexBufferOffset)/8-4, 0)
+
+	vk.CmdEndRendering(cmd)
+
+	//Generate mip maps
+	if cubeTexture.mipLevels > 1 {
+		barriers := []vk.ImageMemoryBarrier{
+			{
+				SType:               vk.StructureTypeImageMemoryBarrier,
+				OldLayout:           vk.ImageLayoutColorAttachmentOptimal,
+				NewLayout:           vk.ImageLayoutTransferSrcOptimal,
+				SrcAccessMask:       vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+				DstAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+				SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+				DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+				Image:               cubeTexture.img,
+				SubresourceRange: vk.ImageSubresourceRange{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					BaseMipLevel:   0,
+					LevelCount:     1,
+					BaseArrayLayer: 0,
+					LayerCount:     6,
+				},
+			},
+			{
+				SType:               vk.StructureTypeImageMemoryBarrier,
+				OldLayout:           vk.ImageLayoutUndefined,
+				NewLayout:           vk.ImageLayoutTransferDstOptimal,
+				SrcAccessMask:       0,
+				DstAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+				SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+				DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+				Image:               cubeTexture.img,
+				SubresourceRange: vk.ImageSubresourceRange{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					BaseMipLevel:   1,
+					LevelCount:     cubeTexture.mipLevels - 1,
+					BaseArrayLayer: 0,
+					LayerCount:     6,
+				},
+			},
+		}
+
+		vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+
+		for i := uint32(1); i < cubeTexture.mipLevels; i++ {
+			imageBlits := []vk.ImageBlit{{
+				SrcSubresource: vk.ImageSubresourceLayers{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					MipLevel:       i - 1,
+					BaseArrayLayer: 0,
+					LayerCount:     6,
+				},
+				SrcOffsets: [2]vk.Offset3D{
+					{
+						X: 0,
+						Y: 0,
+						Z: 0,
+					},
+					{
+						X: (cubeTexture.width >> (i - 1)),
+						Y: (cubeTexture.height >> (i - 1)),
+						Z: 1,
+					},
+				},
+				DstSubresource: vk.ImageSubresourceLayers{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					MipLevel:       i,
+					BaseArrayLayer: 0,
+					LayerCount:     6,
+				},
+				DstOffsets: [2]vk.Offset3D{
+					{
+						X: 0,
+						Y: 0,
+						Z: 0,
+					},
+					{
+						X: (cubeTexture.width >> i),
+						Y: (cubeTexture.height >> i),
+						Z: 1,
+					},
+				},
+			}}
+			vk.CmdBlitImage(cmd, cubeTexture.img, vk.ImageLayoutTransferSrcOptimal, cubeTexture.img, vk.ImageLayoutTransferDstOptimal, uint32(len(imageBlits)), imageBlits, vk.FilterLinear)
+			barriers = []vk.ImageMemoryBarrier{
+				{
+					SType:               vk.StructureTypeImageMemoryBarrier,
+					OldLayout:           vk.ImageLayoutTransferDstOptimal,
+					NewLayout:           vk.ImageLayoutTransferSrcOptimal,
+					SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+					DstAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+					SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+					DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+					Image:               cubeTexture.img,
+					SubresourceRange: vk.ImageSubresourceRange{
+						AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+						BaseMipLevel:   i,
+						LevelCount:     1,
+						BaseArrayLayer: 0,
+						LayerCount:     6,
+					},
+				},
+			}
+			vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+		}
+
+		barriers = []vk.ImageMemoryBarrier{
+			{
+				SType:               vk.StructureTypeImageMemoryBarrier,
+				OldLayout:           vk.ImageLayoutTransferSrcOptimal,
+				NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+				SrcAccessMask:       vk.AccessFlags(vk.AccessTransferReadBit),
+				DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+				SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+				DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+				Image:               cubeTexture.img,
+				SubresourceRange: vk.ImageSubresourceRange{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					BaseMipLevel:   0,
+					LevelCount:     cubeTexture.mipLevels,
+					BaseArrayLayer: 0,
+					LayerCount:     6,
+				},
+			},
+		}
+		vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+	} else {
+		barriers := []vk.ImageMemoryBarrier{
+			{
+				SType:               vk.StructureTypeImageMemoryBarrier,
+				OldLayout:           vk.ImageLayoutColorAttachmentOptimal,
+				NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+				SrcAccessMask:       vk.AccessFlags(vk.AccessTransferWriteBit),
+				DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+				SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+				DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+				Image:               cubeTexture.img,
+				SubresourceRange: vk.ImageSubresourceRange{
+					AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+					BaseMipLevel:   0,
+					LevelCount:     1,
+					BaseArrayLayer: 0,
+					LayerCount:     6,
+				},
+			},
+		}
+		vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+	}
+	vk.EndCommandBuffer(cmd)
+	commandBuffers := []vk.CommandBuffer{cmd}
+	submitInfo := []vk.SubmitInfo{{
+		SType:              vk.StructureTypeSubmitInfo,
+		CommandBufferCount: 1,
+		PCommandBuffers:    commandBuffers,
+	}}
+	vk.QueueSubmit(r.queue, 1, submitInfo, nil)
+	vk.QueueWaitIdle(r.queue)
+}
+
+func (r *Renderer_VK) RenderFilteredCubeMap(distribution int32, cubeTex Texture, filteredTex Texture, mipmapLevel, sampleCount int32, roughness float32) {
+	cubeTexture := cubeTex.(*Texture_VK)
+	filteredTexture := filteredTex.(*Texture_VK)
+	textureSize := filteredTexture.width
+	currentTextureSize := textureSize >> mipmapLevel
+	format := filteredTexture.MapInternalFormat(Max(filteredTexture.depth, 8))
+
+	imageView := r.CreateImageView(filteredTexture.img, format, uint32(mipmapLevel), 1, 6, true)
+
+	defer vk.DestroyImageView(r.device, imageView, nil)
+
+	r.poolMutex.Lock()
+	cmd := r.BeginSingleTimeCommands()
+	r.poolMutex.Unlock()
+	barriers := []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutColorAttachmentOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               filteredTexture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   uint32(mipmapLevel),
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     6,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+
+	colorAttachmentInfos := []vk.RenderingAttachmentInfo{{
+		SType:       vk.StructureTypeRenderingAttachmentInfo,
+		ImageView:   imageView,
+		ImageLayout: vk.ImageLayoutAttachmentOptimal,
+		LoadOp:      vk.AttachmentLoadOpClear,
+		StoreOp:     vk.AttachmentStoreOpStore,
+		ClearValue:  vk.NewClearValue([]float32{0.0, 0.0, 0.0, 1}),
+	}}
+	renderInfo := vk.RenderingInfo{
+		SType: vk.StructureTypeRenderingInfo,
+		RenderArea: vk.Rect2D{
+			Offset: vk.Offset2D{
+				X: 0, Y: 0,
+			},
+			Extent: vk.Extent2D{
+				Width:  uint32(currentTextureSize),
+				Height: uint32(currentTextureSize),
+			},
+		},
+		LayerCount:           6,
+		ViewMask:             0b00111111,
+		ColorAttachmentCount: 1,
+		PColorAttachments:    colorAttachmentInfos,
+	}
+	vk.CmdBeginRendering(cmd, &renderInfo)
+	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, r.cubemapFilteringProgram.pipelines[0])
+
+	vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{r.vertexBuffers[0].buffer}, []vk.DeviceSize{0})
+	r.SetVertexData2(cmd, -1, -1, 1, -1, -1, 1, 1, 1)
+	imageInfo := [][]vk.DescriptorImageInfo{
+		{{
+			ImageLayout: cubeTexture.SampledLayout(),
+			ImageView:   cubeTexture.imageView,
+			Sampler:     cubeTexture.sampler,
+		}},
+	}
+	descriptorWrites := []vk.WriteDescriptorSet{
+		{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstSet:          nil,
+			DstBinding:      0,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			PImageInfo:      imageInfo[0],
+		},
+	}
+	r.FlushDescriptors(r.cubemapFilteringProgram, cmd, descriptorWrites, true)
+	pushConstants := struct {
+		sampleCount    int32
+		distribution   int32
+		width          int32
+		roughness      float32
+		intensityScale float32
+		isLUT          bool
+		_padding       [3]bool
+	}{sampleCount, distribution, textureSize, roughness, 1, false, [3]bool{}}
+
+	vk.CmdPushConstants(cmd, r.cubemapFilteringProgram.pipelineLayout, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 4*6, unsafe.Pointer(&pushConstants))
+	viewports := []vk.Viewport{{
+		MinDepth: 0.0,
+		MaxDepth: 1.0,
+		X:        0.0,
+		Y:        0.0,
+		Width:    float32(currentTextureSize),
+		Height:   float32(currentTextureSize),
+	}}
+	scissor := vk.Rect2D{
+		Offset: vk.Offset2D{
+			X: 0,
+			Y: 0,
+		},
+		Extent: vk.Extent2D{
+			Width:  uint32(currentTextureSize),
+			Height: uint32(currentTextureSize),
+		},
+	}
+	vk.CmdSetViewport(cmd, 0, 1, viewports)
+	scissors := []vk.Rect2D{scissor}
+	vk.CmdSetScissor(cmd, 0, 1, scissors)
+
+	vk.CmdDraw(cmd, 4, 1, uint32(r.vertexBufferOffset)/8-4, 0)
+
+	vk.CmdEndRendering(cmd)
+
+	barriers = []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutColorAttachmentOptimal,
+			NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+			DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               filteredTexture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   uint32(mipmapLevel),
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     6,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+	r.poolMutex.Lock()
+	r.EndSingleTimeCommands(cmd)
+	r.poolMutex.Unlock()
+}
+func (r *Renderer_VK) RenderLUT(distribution int32, cubeTex Texture, lutTex Texture, sampleCount int32) {
+	cubeTexture := cubeTex.(*Texture_VK)
+	lutTexture := lutTex.(*Texture_VK)
+	textureSize := lutTexture.width
+
+	r.poolMutex.Lock()
+	cmd := r.BeginSingleTimeCommands()
+	r.poolMutex.Unlock()
+	barriers := []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutUndefined,
+			NewLayout:           vk.ImageLayoutColorAttachmentOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessNone),
+			DstAccessMask:       vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               lutTexture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+
+	colorAttachmentInfos := []vk.RenderingAttachmentInfo{{
+		SType:       vk.StructureTypeRenderingAttachmentInfo,
+		ImageView:   lutTexture.imageView,
+		ImageLayout: vk.ImageLayoutAttachmentOptimal,
+		LoadOp:      vk.AttachmentLoadOpClear,
+		StoreOp:     vk.AttachmentStoreOpStore,
+		ClearValue:  vk.NewClearValue([]float32{0.0, 0.0, 0.0, 1}),
+	}}
+	renderInfo := vk.RenderingInfo{
+		SType: vk.StructureTypeRenderingInfo,
+		RenderArea: vk.Rect2D{
+			Offset: vk.Offset2D{
+				X: 0, Y: 0,
+			},
+			Extent: vk.Extent2D{
+				Width:  uint32(textureSize),
+				Height: uint32(textureSize),
+			},
+		},
+		LayerCount:           1,
+		ViewMask:             0b00000001,
+		ColorAttachmentCount: 1,
+		PColorAttachments:    colorAttachmentInfos,
+	}
+	vk.CmdBeginRendering(cmd, &renderInfo)
+	vk.CmdBindPipeline(cmd, vk.PipelineBindPointGraphics, r.lutProgram.pipelines[0])
+
+	vk.CmdBindVertexBuffers(cmd, 0, 1, []vk.Buffer{r.vertexBuffers[0].buffer}, []vk.DeviceSize{0})
+	r.SetVertexData2(cmd, -1, -1, 1, -1, -1, 1, 1, 1)
+	imageInfo := [][]vk.DescriptorImageInfo{
+		{{
+			ImageLayout: cubeTexture.SampledLayout(),
+			ImageView:   cubeTexture.imageView,
+			Sampler:     cubeTexture.sampler,
+		}},
+	}
+	descriptorWrites := []vk.WriteDescriptorSet{
+		{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstSet:          nil,
+			DstBinding:      0,
+			DstArrayElement: 0,
+			DescriptorCount: 1,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			PImageInfo:      imageInfo[0],
+		},
+	}
+	r.FlushDescriptors(r.lutProgram, cmd, descriptorWrites, true)
+	pushConstants := struct {
+		sampleCount    int32
+		distribution   int32
+		width          int32
+		roughness      float32
+		intensityScale float32
+		isLUT          bool
+		_padding       [3]bool
+	}{sampleCount, distribution, textureSize, 0, 1, true, [3]bool{}}
+	vk.CmdPushConstants(cmd, r.lutProgram.pipelineLayout, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 0, 4*6, unsafe.Pointer(&pushConstants))
+	viewports := []vk.Viewport{{
+		MinDepth: 0.0,
+		MaxDepth: 1.0,
+		X:        0.0,
+		Y:        0.0,
+		Width:    float32(textureSize),
+		Height:   float32(textureSize),
+	}}
+	scissor := vk.Rect2D{
+		Offset: vk.Offset2D{
+			X: 0,
+			Y: 0,
+		},
+		Extent: vk.Extent2D{
+			Width:  uint32(textureSize),
+			Height: uint32(textureSize),
+		},
+	}
+	vk.CmdSetViewport(cmd, 0, 1, viewports)
+	scissors := []vk.Rect2D{scissor}
+	vk.CmdSetScissor(cmd, 0, 1, scissors)
+
+	vk.CmdDraw(cmd, 4, 1, uint32(r.vertexBufferOffset)/8-4, 0)
+
+	vk.CmdEndRendering(cmd)
+
+	barriers = []vk.ImageMemoryBarrier{
+		{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           vk.ImageLayoutColorAttachmentOptimal,
+			NewLayout:           vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask:       vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+			DstAccessMask:       vk.AccessFlags(vk.AccessShaderReadBit),
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               lutTexture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, uint32(len(barriers)), barriers)
+
+	r.poolMutex.Lock()
+	r.EndSingleTimeCommands(cmd)
+	r.poolMutex.Unlock()
+}
+
+func (r *Renderer_VK) FlushTempCommands() {
+	if len(r.stagingImageBarriers[0]) == 0 && len(r.tempCommands) == 0 {
+		return
+	}
+	commandBuffers := r.tempCommands
+	if len(r.stagingImageBarriers[0]) > 0 {
+		commandBuffer := r.BeginSingleTimeCommands()
+		vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTopOfPipeBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, uint32(len(r.stagingImageBarriers[0])), r.stagingImageBarriers[0])
+		for img := range r.stagingImageCopyRegions {
+			regions := r.stagingImageCopyRegions[img]
+			vk.CmdCopyBufferToImage(commandBuffer, r.stagingBuffers[r.stagingBufferIndex].buffer, img, vk.ImageLayoutTransferDstOptimal, uint32(len(regions)), regions)
+		}
+		vk.CmdPipelineBarrier(commandBuffer, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit), 0, 0, nil, 0, nil, uint32(len(r.stagingImageBarriers[1])), r.stagingImageBarriers[1])
+		vk.EndCommandBuffer(commandBuffer)
+		commandBuffers = append([]vk.CommandBuffer{commandBuffer}, commandBuffers...)
+		r.stagingBufferOffset = 0
+		r.stagingImageBarriers[0] = r.stagingImageBarriers[0][:0]
+		r.stagingImageBarriers[1] = r.stagingImageBarriers[1][:0]
+		r.stagingImageCopyRegions = make(map[vk.Image][]vk.BufferImageCopy)
+		if r.stagingBufferFences[r.stagingBufferIndex] {
+			vk.WaitForFences(r.device, 1, r.fences[1+r.stagingBufferIndex:2+r.stagingBufferIndex], vk.True, 10*1000*1000*1000)
+			vk.ResetFences(r.device, 1, r.fences[1+r.stagingBufferIndex:2+r.stagingBufferIndex])
+		}
+		submitInfo := []vk.SubmitInfo{{
+			SType:              vk.StructureTypeSubmitInfo,
+			CommandBufferCount: uint32(len(commandBuffers)),
+			PCommandBuffers:    commandBuffers,
+		}}
+		vk.QueueSubmit(r.queue, 1, submitInfo, r.fences[1+r.stagingBufferIndex])
+		r.stagingBufferFences[r.stagingBufferIndex] = true
+		if r.stagingBufferIndex == 0 {
+			r.stagingBufferIndex = 1
+		} else {
+			r.stagingBufferIndex = 0
+		}
+	} else {
+		submitInfo := []vk.SubmitInfo{{
+			SType:              vk.StructureTypeSubmitInfo,
+			CommandBufferCount: uint32(len(commandBuffers)),
+			PCommandBuffers:    commandBuffers,
+		}}
+		vk.QueueSubmit(r.queue, 1, submitInfo, nil)
+	}
+	r.usedCommands = append(r.usedCommands, commandBuffers...)
+	r.tempCommands = r.tempCommands[:0]
+	return
+}
+
+func (r *Renderer_VK) CopyToStagingBuffer(size uint32, src []byte) vk.DeviceSize {
+	// Ensures the value we return is always a multiple of 16
+	if r.stagingBufferOffset%16 > 0 {
+		r.stagingBufferOffset += 16 - (r.stagingBufferOffset % 16)
+	}
+	if size > uint32(r.stagingBuffers[r.stagingBufferIndex].size) {
+		r.FlushTempCommands()
+		if size > uint32(r.stagingBuffers[r.stagingBufferIndex].size) {
+			r.ResizeStagingBuffer(size)
+		}
+	}
+	if size+r.stagingBufferOffset > uint32(r.stagingBuffers[r.stagingBufferIndex].size) {
+		r.FlushTempCommands()
+	}
+	if r.stagingBufferFences[r.stagingBufferIndex] {
+		vk.WaitForFences(r.device, 1, r.fences[1+r.stagingBufferIndex:2+r.stagingBufferIndex], vk.True, 10*1000*1000*1000)
+		vk.ResetFences(r.device, 1, r.fences[1+r.stagingBufferIndex:2+r.stagingBufferIndex])
+		r.stagingBufferFences[r.stagingBufferIndex] = false
+	}
+	n := vk.Memcopy(unsafe.Add(r.stagingBuffers[r.stagingBufferIndex].data, r.stagingBufferOffset), src)
+	if n != int(size) {
+		LogMessage("[WARN] failed to copy image data")
+	}
+	ret := vk.DeviceSize(r.stagingBufferOffset)
+	//if size%16 > 0 {
+	//	r.stagingBufferOffset += size + 16 - (size % 16)
+	//} else {
+	//	r.stagingBufferOffset += size
+	//}
+	r.stagingBufferOffset += size
+	return ret
+}
+
+func (r *Renderer_VK) ResizeStagingBuffer(size uint32) {
+	r.stagingBufferFences[r.stagingBufferIndex] = false
+	r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+		VulkanResourceTypeFence,
+		[]interface{}{
+			r.fences[1+r.stagingBufferIndex],
+		},
+	}
+	var fence vk.Fence
+	fenceCreateInfo := vk.FenceCreateInfo{
+		SType: vk.StructureTypeFenceCreateInfo,
+	}
+	err := vk.Error(vk.CreateFence(r.device, &fenceCreateInfo, nil, &fence))
+	if err != nil {
+		panic(err)
+	}
+	r.fences[1+r.stagingBufferIndex] = fence
+	r.destroyResourceQueues[r.destroyResourceQueueIndex] <- VulkanResource{
+		VulkanResourceTypeBuffer,
+		[]interface{}{
+			r.stagingBuffers[r.stagingBufferIndex].buffer, r.stagingBuffers[r.stagingBufferIndex].bufferMemory,
+		},
+	}
+	vk.UnmapMemory(r.device, r.stagingBuffers[r.stagingBufferIndex].bufferMemory)
+	var stagingBufferMemory vk.DeviceMemory
+	var data unsafe.Pointer
+	stagingBuffer, err := r.CreateBuffer(vk.DeviceSize(size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &stagingBufferMemory)
+	if err != nil {
+		panic(err)
+	}
+	vk.MapMemory(r.device, stagingBufferMemory, 0, vk.DeviceSize(size), 0, &data)
+	r.stagingBuffers[r.stagingBufferIndex].buffer = stagingBuffer
+	r.stagingBuffers[r.stagingBufferIndex].bufferMemory = stagingBufferMemory
+	r.stagingBuffers[r.stagingBufferIndex].data = data
+	r.stagingBuffers[r.stagingBufferIndex].size = uintptr(size)
+	r.stagingBufferOffset = 0
+}
+func (r *Renderer_VK) PerspectiveProjectionMatrix(angle, aspect, near, far float32) mgl.Mat4 {
+	return mgl.Perspective(angle, aspect, near/2, far)
+}
+
+func (r *Renderer_VK) OrthographicProjectionMatrix(left, right, bottom, top, near, far float32) mgl.Mat4 {
+	ret := mgl.Ortho(left, right, bottom, top, near, far)
+	ret[10] *= 0.5
+	ret[14] = ret[14]*0.5 + 0.5
+	return ret
+}
+
+func (r *Renderer_VK) NewWorkerThread() bool {
+	r.renderShadowMap = true
+	r.waitGroup.Add(1)
+	return true
+}
+
+func (r *Renderer_VK) rgbToRGBA(input []float32) []float32 {
+	result := make([]float32, 0, len(input)/3*4)
+	for i, val := range input {
+		result = append(result, val)
+		if (i+1)%3 == 0 {
+			result = append(result, 1)
+		}
+	}
+	return result
+}
+
+func (r *Renderer_VK) rgbtoRGBABytes(input []byte) []byte {
+	result := make([]byte, 0, len(input)/3*4)
+	for i, val := range input {
+		result = append(result, val)
+		if (i+1)%3 == 0 {
+			result = append(result, 255)
+		}
+	}
+	return result
+}
+
+func (r *Renderer_VK) AlignUniformSize(uniformSize uint32) uint32 {
+	minAlignment := r.minUniformBufferOffsetAlignment
+	if uniformSize < minAlignment {
+		uniformSize = minAlignment
+	} else if uniformSize > minAlignment && minAlignment > 0 && uniformSize%minAlignment != 0 {
+		uniformSize = (uniformSize/minAlignment + 1) * minAlignment
+	}
+	return uniformSize
+}
+
+func (r *Renderer_VK) CreateImage(width, height uint32, format vk.Format, mipLevel uint32, layerCount uint32, usage vk.ImageUsageFlags, numSamples int32, tiling vk.ImageTiling, cube bool) vk.Image {
+	imageExtent := vk.Extent3D{
+		Width:  width,
+		Height: height,
+		Depth:  1,
+	}
+	imageInfo := &vk.ImageCreateInfo{
+		SType:         vk.StructureTypeImageCreateInfo,
+		ImageType:     vk.ImageType2d,
+		Extent:        imageExtent,
+		MipLevels:     mipLevel,
+		ArrayLayers:   layerCount,
+		Format:        format,
+		Tiling:        tiling,
+		InitialLayout: vk.ImageLayoutUndefined,
+		Usage:         usage,
+		Samples:       vk.SampleCountFlagBits(numSamples),
+		SharingMode:   vk.SharingModeExclusive,
+	}
+	if cube {
+		imageInfo.Flags = vk.ImageCreateFlags(vk.ImageCreateCubeCompatibleBit)
+	} else if layerCount > 1 {
+		imageInfo.ImageType = vk.ImageType2d
+	}
+	var img vk.Image
+	err := vk.Error(vk.CreateImage(r.device, imageInfo, nil, &img))
+	if err != nil {
+		panic(err)
+	}
+	return img
+}
+
+func (r *Renderer_VK) CreateImageView(img vk.Image, format vk.Format, baseLevel uint32, mipLevel uint32, layerCount uint32, cube bool) vk.ImageView {
+	var imageView vk.ImageView
+	viewCreateInfo := vk.ImageViewCreateInfo{
+		SType:    vk.StructureTypeImageViewCreateInfo,
+		Image:    img,
+		ViewType: vk.ImageViewType2d,
+		Format:   format,
+		Components: vk.ComponentMapping{
+			R: vk.ComponentSwizzleR,
+			G: vk.ComponentSwizzleG,
+			B: vk.ComponentSwizzleB,
+			A: vk.ComponentSwizzleA,
+		},
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   baseLevel,
+			LevelCount:     mipLevel,
+			BaseArrayLayer: 0,
+			LayerCount:     layerCount,
+		},
+	}
+	if cube {
+		if layerCount == 6 {
+			viewCreateInfo.ViewType = vk.ImageViewTypeCube
+		} else if layerCount > 6 {
+			viewCreateInfo.ViewType = vk.ImageViewTypeCubeArray
+		}
+	} else if layerCount > 1 {
+		viewCreateInfo.ViewType = vk.ImageViewType2dArray
+	}
+	if format == vk.FormatD32Sfloat {
+		viewCreateInfo.SubresourceRange.AspectMask = vk.ImageAspectFlags(vk.ImageAspectDepthBit)
+	}
+	err := vk.Error(vk.CreateImageView(r.device, &viewCreateInfo, nil, &imageView))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateImageView failed with %s", err)
+		panic(err)
+	}
+	return imageView
+}
+
+func (r *Renderer_VK) AllocateImageMemory(img vk.Image, memoryProperty vk.MemoryPropertyFlagBits) vk.DeviceMemory {
+	alloc, err := r.allocator.AllocateImageMemory(img, memoryProperty)
+	if err != nil {
+		err = fmt.Errorf("allocator.AllocateImageMemory failed with %s", err)
+		panic(err)
+	}
+	return alloc.deviceMemory
+}
+
+func (r *Renderer_VK) SetVSync(interval int) {
+	// We just ignore the interval here and force it on
+	r.setVSync = true
+}
+
+func (r *Renderer_VK) LoadCustomSpriteShader(shaderName string, shaderData []byte) uint32 {
+	if id, ok := r.customShaderMap[shaderName]; ok {
+		return id
+	}
+
+	needsGrabPass := bytes.Contains(shaderData, []byte("bgl_RenderedTexture"))
+
+	program, err := r.createCustomSpriteProgram(shaderData)
+	if err != nil {
+		LogMessage("[VK Error] Failed to create pipeline for custom shader %s: %v", shaderName, err)
+		return 0
+	}
+	program.needsGrabPass = needsGrabPass
+	id := r.nextShaderID
+	r.nextShaderID++
+	r.customPrograms[id] = program
+	r.customShaderMap[shaderName] = id
+	sys.appendToConsole(fmt.Sprintf("Loaded Custom VK Shader: %s (ID: %d, NeedsGrabPass: %v)", shaderName, id, needsGrabPass))
+	return id
+}
+
+func (r *Renderer_VK) UnloadCustomSpriteShader(shaderName string) {
+	if id, exists := r.customShaderMap[shaderName]; exists {
+		if program, hasProg := r.customPrograms[id]; hasProg {
+			vk.DeviceWaitIdle(r.device)
+
+			r.DestroyPipelines(program)
+			delete(r.customPrograms, id)
+
+			if r.VKState.currentProgram == program {
+				r.VKState.currentProgram = nil
+				r.VKState.boundProgram = nil
+			}
+		}
+		delete(r.customShaderMap, shaderName)
+		//LogMessage("Unloaded Custom VK Shader: %s", shaderName)
+	}
+}
+
+func (r *Renderer_VK) createCustomSpriteProgram(fragSpv []byte) (*VulkanProgramInfo, error) {
+	program := &VulkanProgramInfo{}
+	var uniformBufferMemory vk.DeviceMemory
+	var err error
+
+	minAlignment := r.minUniformBufferOffsetAlignment
+	uniformSize := uint32(Max(int(unsafe.Sizeof(VulkanSpriteProgramVertUniformBufferObject{})), int(unsafe.Sizeof(VulkanSpriteProgramFragUniformBufferObject{}))))
+	if uniformSize < minAlignment {
+		uniformSize = minAlignment
+	} else if uniformSize > minAlignment && minAlignment > 0 && uniformSize%minAlignment != 0 {
+		uniformSize = (uniformSize/minAlignment + 1) * minAlignment
+	}
+
+	program.uniformBuffers = make([]VulkanBuffer, 1)
+	program.uniformBuffers[0].size = uintptr(10000 * uniformSize)
+	program.uniformSize = uniformSize
+	program.uniformBuffers[0].buffer, err = r.CreateBuffer(vk.DeviceSize(program.uniformBuffers[0].size), vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit|vk.BufferUsageUniformBufferBit), (vk.MemoryPropertyHostVisibleBit | vk.MemoryPropertyHostCoherentBit), &uniformBufferMemory)
+	if err != nil {
+		return nil, err
+	}
+	program.uniformBuffers[0].bufferMemory = uniformBufferMemory
+	var uniformData unsafe.Pointer
+	vk.MapMemory(r.device, program.uniformBuffers[0].bufferMemory, 0, vk.DeviceSize(program.uniformBuffers[0].size), 0, &uniformData)
+	program.uniformBuffers[0].data = uniformData
+
+	VertShader, err := staticFiles.ReadFile("shaders/sprite.vert.spv")
+	if err != nil {
+		return nil, err
+	}
+	VertShader2 := make([]uint32, len(VertShader)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&VertShader2)).Data), VertShader)
+	vertShader, err := r.CreateShader(r.device, VertShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, vertShader, nil)
+
+	FragShader2 := make([]uint32, len(fragSpv)/4)
+	vk.Memcopy(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&FragShader2)).Data), fragSpv)
+	fragShader, err := r.CreateShader(r.device, FragShader2)
+	if err != nil {
+		return nil, err
+	}
+	defer vk.DestroyShaderModule(r.device, fragShader, nil)
+
+	shaderStages := []vk.PipelineShaderStageCreateInfo{
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageVertexBit,
+			Module: vertShader,
+			PName:  "main\x00",
+		},
+		{
+			SType:  vk.StructureTypePipelineShaderStageCreateInfo,
+			Stage:  vk.ShaderStageFragmentBit,
+			Module: fragShader,
+			PName:  "main\x00",
+		},
+	}
+
+	// 0: Vert UBO, 1: Frag UBO, 2: Tex, 3: Pal, 4: bgl_RenderedTexture (GrabPass用)
+	samplerLayoutBinding := []vk.DescriptorSetLayoutBinding{
+		{Binding: 0, DescriptorCount: 1, DescriptorType: vk.DescriptorTypeUniformBuffer, StageFlags: vk.ShaderStageFlags(vk.ShaderStageVertexBit)},
+		{Binding: 1, DescriptorCount: 1, DescriptorType: vk.DescriptorTypeUniformBuffer, StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit)},
+		{Binding: 2, DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler, StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit)},
+		{Binding: 3, DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler, StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit)},
+		{Binding: 4, DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler, StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit)}, // GrabPass
+		{Binding: 5, DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler, StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit)}, // tex1
+		{Binding: 6, DescriptorCount: 1, DescriptorType: vk.DescriptorTypeCombinedImageSampler, StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit)}, // tex2
+	}
+	layoutInfo := vk.DescriptorSetLayoutCreateInfo{
+		SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
+		Flags:        vk.DescriptorSetLayoutCreateFlags(vk.DescriptorSetLayoutCreatePushDescriptorBit),
+		BindingCount: uint32(len(samplerLayoutBinding)),
+		PBindings:    samplerLayoutBinding,
+	}
+	var descriptorSetLayout vk.DescriptorSetLayout
+	vk.CreateDescriptorSetLayout(r.device, &layoutInfo, nil, &descriptorSetLayout)
+	program.descriptorSetLayouts = append(program.descriptorSetLayouts, descriptorSetLayout)
+
+	pushConstantRanges := []vk.PushConstantRange{
+		{
+			StageFlags: vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+			Offset:     0,
+			Size:       16 + 64, // 80 bytes
+		},
+	}
+	pipelineLayoutCreateInfo := vk.PipelineLayoutCreateInfo{
+		SType:                  vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount:         1,
+		PSetLayouts:            []vk.DescriptorSetLayout{descriptorSetLayout},
+		PushConstantRangeCount: uint32(len(pushConstantRanges)),
+		PPushConstantRanges:    pushConstantRanges,
+	}
+	var pipelineLayout vk.PipelineLayout
+	vk.CreatePipelineLayout(r.device, &pipelineLayoutCreateInfo, nil, &pipelineLayout)
+	program.pipelineLayout = pipelineLayout
+
+	dynamicStates := []vk.DynamicState{
+		vk.DynamicStateViewport,
+		vk.DynamicStateScissor,
+	}
+	viewportState := vk.PipelineViewportStateCreateInfo{
+		SType:         vk.StructureTypePipelineViewportStateCreateInfo,
+		ViewportCount: 1,
+		ScissorCount:  1,
+	}
+	dynamicState := vk.PipelineDynamicStateCreateInfo{
+		SType:             vk.StructureTypePipelineDynamicStateCreateInfo,
+		DynamicStateCount: uint32(len(dynamicStates)),
+		PDynamicStates:    dynamicStates,
+	}
+	var primitiveRestartEnable vk.Bool32 = vk.False
+	if runtime.GOOS == "ios" {
+		primitiveRestartEnable = vk.True
+	}
+	inputAssemblyState := vk.PipelineInputAssemblyStateCreateInfo{
+		SType:                  vk.StructureTypePipelineInputAssemblyStateCreateInfo,
+		Topology:               vk.PrimitiveTopologyTriangleStrip,
+		PrimitiveRestartEnable: primitiveRestartEnable,
+	}
+	vertexInputBindings := []vk.VertexInputBindingDescription{{
+		Binding:   0,
+		Stride:    4 * 4, // 4 = sizeof(float32)
+		InputRate: vk.VertexInputRateVertex,
+	}}
+	vertexInputAttributes := []vk.VertexInputAttributeDescription{{
+		Binding:  0,
+		Location: 0,
+		Format:   vk.FormatR32g32Sfloat,
+		Offset:   0,
+	}, {
+		Binding:  0,
+		Location: 1,
+		Format:   vk.FormatR32g32Sfloat,
+		Offset:   8,
+	}}
+	vertexInputState := vk.PipelineVertexInputStateCreateInfo{
+		SType:                           vk.StructureTypePipelineVertexInputStateCreateInfo,
+		VertexBindingDescriptionCount:   uint32(len(vertexInputBindings)),
+		PVertexBindingDescriptions:      vertexInputBindings,
+		VertexAttributeDescriptionCount: uint32(len(vertexInputAttributes)),
+		PVertexAttributeDescriptions:    vertexInputAttributes,
+	}
+	sampleMask := []vk.SampleMask{vk.SampleMask(vk.MaxUint32)}
+	msaa := sys.msaa
+	if msaa <= 0 {
+		msaa = 1
+	}
+	multisampleState := vk.PipelineMultisampleStateCreateInfo{
+		SType:                 vk.StructureTypePipelineMultisampleStateCreateInfo,
+		RasterizationSamples:  vk.SampleCountFlagBits(msaa),
+		SampleShadingEnable:   vk.False,
+		PSampleMask:           sampleMask,
+		MinSampleShading:      1,
+		AlphaToCoverageEnable: 0,
+		AlphaToOneEnable:      0,
+	}
+	rasterState := vk.PipelineRasterizationStateCreateInfo{
+		SType:                   vk.StructureTypePipelineRasterizationStateCreateInfo,
+		DepthClampEnable:        vk.False,
+		RasterizerDiscardEnable: vk.False,
+		PolygonMode:             vk.PolygonModeFill,
+		CullMode:                vk.CullModeFlags(vk.CullModeNone),
+		FrontFace:               vk.FrontFaceClockwise,
+		DepthBiasEnable:         vk.False,
+		DepthBiasConstantFactor: 0,
+		DepthBiasClamp:          0,
+		DepthBiasSlopeFactor:    0,
+		LineWidth:               1,
+	}
+	depthStencilState := vk.PipelineDepthStencilStateCreateInfo{
+		SType:             vk.StructureTypePipelineDepthStencilStateCreateInfo,
+		DepthTestEnable:   vk.False,
+		DepthWriteEnable:  vk.False,
+		StencilTestEnable: vk.False,
+	}
+	blendFunctions := []struct {
+		op  vk.BlendOp
+		src vk.BlendFactor
+		dst vk.BlendFactor
+	}{
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorZero,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorOne,
+			dst: vk.BlendFactorZero,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorZero,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorSrcAlpha,
+			dst: vk.BlendFactorZero,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpAdd,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorZero,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorOneMinusSrcAlpha,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorOne,
+		},
+		{
+			op:  vk.BlendOpReverseSubtract,
+			src: vk.BlendFactorZero,
+			dst: vk.BlendFactorZero,
+		},
+	}
+	attachmentStates := make([]vk.PipelineColorBlendAttachmentState, 0, len(blendFunctions))
+	colorBlendStates := make([]vk.PipelineColorBlendStateCreateInfo, 0, len(blendFunctions))
+	pipelineCreateInfos := make([]vk.GraphicsPipelineCreateInfo, 0, len(blendFunctions))
+	pipelineIndexMap := map[interface{}]int{}
+	MapBlendEquation := func(i vk.BlendOp) BlendEquation {
+		var BlendEquationLUT = map[vk.BlendOp]BlendEquation{
+			vk.BlendOpAdd:             BlendAdd,
+			vk.BlendOpReverseSubtract: BlendReverseSubtract,
+		}
+		return BlendEquationLUT[i]
+	}
+
+	MapBlendFactor := func(i vk.BlendFactor) BlendFunc {
+		var MapBlendFactor = map[vk.BlendFactor]BlendFunc{
+			vk.BlendFactorOne:              BlendOne,
+			vk.BlendFactorZero:             BlendZero,
+			vk.BlendFactorSrcAlpha:         BlendSrcAlpha,
+			vk.BlendFactorOneMinusSrcAlpha: BlendOneMinusSrcAlpha,
+			vk.BlendFactorOneMinusDstColor: BlendOneMinusDstColor,
+			vk.BlendFactorDstColor:         BlendDstColor,
+		}
+		return MapBlendFactor[i]
+	}
+	for i := range blendFunctions {
+		attachmentStates = append(attachmentStates, vk.PipelineColorBlendAttachmentState{
+			ColorWriteMask: vk.ColorComponentFlags(
+				vk.ColorComponentRBit | vk.ColorComponentGBit |
+					vk.ColorComponentBBit | vk.ColorComponentABit,
+			),
+			BlendEnable:         vk.True,
+			SrcColorBlendFactor: blendFunctions[i].src,
+			DstColorBlendFactor: blendFunctions[i].dst,
+			ColorBlendOp:        blendFunctions[i].op,
+			SrcAlphaBlendFactor: vk.BlendFactorOne,
+			DstAlphaBlendFactor: vk.BlendFactorZero,
+			AlphaBlendOp:        vk.BlendOpAdd,
+		})
+		colorBlendStates = append(colorBlendStates, vk.PipelineColorBlendStateCreateInfo{
+			SType:           vk.StructureTypePipelineColorBlendStateCreateInfo,
+			LogicOpEnable:   vk.False,
+			LogicOp:         vk.LogicOpCopy,
+			AttachmentCount: 1,
+			PAttachments:    []vk.PipelineColorBlendAttachmentState{attachmentStates[i]},
+		})
+		pipelineCreateInfos = append(pipelineCreateInfos, vk.GraphicsPipelineCreateInfo{
+			SType:               vk.StructureTypeGraphicsPipelineCreateInfo,
+			StageCount:          2, // vert + frag
+			PStages:             shaderStages,
+			PVertexInputState:   &vertexInputState,
+			PInputAssemblyState: &inputAssemblyState,
+			PViewportState:      &viewportState,
+			PRasterizationState: &rasterState,
+			PMultisampleState:   &multisampleState,
+			PColorBlendState:    &colorBlendStates[i],
+			PDynamicState:       &dynamicState,
+			Layout:              program.pipelineLayout,
+			RenderPass:          r.mainRenderPass.renderPass,
+			PDepthStencilState:  &depthStencilState,
+		})
+		pipelineIndexMap[VulkanBlendState{
+			op:  MapBlendEquation(blendFunctions[i].op),
+			src: MapBlendFactor(blendFunctions[i].src),
+			dst: MapBlendFactor(blendFunctions[i].dst),
+		}] = i
+	}
+	pipelines := make([]vk.Pipeline, len(pipelineCreateInfos))
+	err = vk.Error(vk.CreateGraphicsPipelines(r.device,
+		r.pipelineCache, uint32(len(pipelineCreateInfos)), pipelineCreateInfos, nil, pipelines))
+	if err != nil {
+		err = fmt.Errorf("vk.CreateGraphicsPipelines failed with %s", err)
+		return nil, err
+	}
+	program.pipelines = pipelines
+
+	program.pipelineIndexMap = pipelineIndexMap
+
+	return program, nil
+}
+
+func (r *Renderer_VK) SetSpritePipeline(shaderName string) {
+	targetProgram := r.spriteProgram
+	if shaderName != "" {
+		if id, ok := r.customShaderMap[shaderName]; ok {
+			if shader, ok := r.customPrograms[id]; ok {
+				targetProgram = shader
+			}
+		}
+	}
+
+	if r.VKState.currentProgram == targetProgram {
+		return
+	}
+	r.VKState.currentProgram = targetProgram
+}
+
+func (r *Renderer_VK) SetCustomUniforms(params [16]float32) {
+	if r.VKState.currentProgram == nil {
+		return
+	}
+	vk.CmdPushConstants(r.commandBuffers[0], r.VKState.currentProgram.pipelineLayout, vk.ShaderStageFlags(vk.ShaderStageFragmentBit), 16, 64, unsafe.Pointer(&params[0]))
+}
+
+func (r *Renderer_VK) NeedsGrabPass() bool {
+	if r.VKState.currentProgram != nil {
+		return r.VKState.currentProgram.needsGrabPass
+	}
+	return false
+}
+
+func (r *Renderer_VK) ResolveBackBuffer() Texture {
+	cmd := r.commandBuffers[0]
+
+	vk.CmdEndRenderPass(cmd)
+
+	barriers := []vk.ImageMemoryBarrier{
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			OldLayout:     vk.ImageLayoutColorAttachmentOptimal,
+			NewLayout:     vk.ImageLayoutTransferSrcOptimal,
+			SrcAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+			DstAccessMask: vk.AccessFlags(vk.AccessTransferReadBit),
+			Image:         r.mainRenderTarget.texture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LevelCount: 1, LayerCount: 1,
+			},
+		},
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			OldLayout:     vk.ImageLayoutUndefined,
+			NewLayout:     vk.ImageLayoutTransferDstOptimal,
+			SrcAccessMask: vk.AccessFlags(vk.AccessNone),
+			DstAccessMask: vk.AccessFlags(vk.AccessTransferWriteBit),
+			Image:         r.grabTexture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LevelCount: 1, LayerCount: 1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit), vk.PipelineStageFlags(vk.PipelineStageTransferBit), 0, 0, nil, 0, nil, 2, barriers)
+
+	blit := []vk.ImageBlit{{
+		SrcSubresource: vk.ImageSubresourceLayers{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LayerCount: 1},
+		SrcOffsets:     [2]vk.Offset3D{{0, 0, 0}, {int32(sys.scrrect[2]), int32(sys.scrrect[3]), 1}},
+		DstSubresource: vk.ImageSubresourceLayers{AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LayerCount: 1},
+		DstOffsets:     [2]vk.Offset3D{{0, 0, 0}, {int32(sys.scrrect[2]), int32(sys.scrrect[3]), 1}},
+	}}
+	vk.CmdBlitImage(cmd, r.mainRenderTarget.texture.img, vk.ImageLayoutTransferSrcOptimal, r.grabTexture.img, vk.ImageLayoutTransferDstOptimal, 1, blit, vk.FilterNearest)
+
+	barriers2 := []vk.ImageMemoryBarrier{
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			OldLayout:     vk.ImageLayoutTransferSrcOptimal,
+			NewLayout:     vk.ImageLayoutColorAttachmentOptimal,
+			SrcAccessMask: vk.AccessFlags(vk.AccessTransferReadBit),
+			DstAccessMask: vk.AccessFlags(vk.AccessColorAttachmentWriteBit),
+			Image:         r.mainRenderTarget.texture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LevelCount: 1, LayerCount: 1,
+			},
+		},
+		{
+			SType:         vk.StructureTypeImageMemoryBarrier,
+			OldLayout:     vk.ImageLayoutTransferDstOptimal,
+			NewLayout:     vk.ImageLayoutShaderReadOnlyOptimal,
+			SrcAccessMask: vk.AccessFlags(vk.AccessTransferWriteBit),
+			DstAccessMask: vk.AccessFlags(vk.AccessShaderReadBit),
+			Image:         r.grabTexture.img,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask: vk.ImageAspectFlags(vk.ImageAspectColorBit), LevelCount: 1, LayerCount: 1,
+			},
+		},
+	}
+	vk.CmdPipelineBarrier(cmd, vk.PipelineStageFlags(vk.PipelineStageTransferBit), vk.PipelineStageFlags(vk.PipelineStageFragmentShaderBit|vk.PipelineStageColorAttachmentOutputBit), 0, 0, nil, 0, nil, 2, barriers2)
+
+	renderPassBeginInfo := vk.RenderPassBeginInfo{
+		SType:       vk.StructureTypeRenderPassBeginInfo,
+		RenderPass:  r.mainRenderPass.renderPass,
+		Framebuffer: r.mainRenderTarget.framebuffer,
+		RenderArea:  vk.Rect2D{Offset: vk.Offset2D{X: 0, Y: 0}, Extent: vk.Extent2D{Width: uint32(sys.scrrect[2]), Height: uint32(sys.scrrect[3])}},
+	}
+	vk.CmdBeginRenderPass(cmd, &renderPassBeginInfo, vk.SubpassContentsInline)
+
+	r.VKState.boundProgram = nil
+	r.VKState.currentPipeline = nil
+	r.VKState.spriteVertUniformBufferOffset = 0xFFFFFFFF
+	r.VKState.spriteFragUniformBufferOffset = 0xFFFFFFFF
+	r.VKState.modelUniformBufferOffset1 = 0xFFFFFFFF
+	r.VKState.modelUniformBufferOffset2 = 0xFFFFFFFF
+	r.currentSpriteTexture.spriteTexture = nil
+	r.currentSpriteTexture.palTexture = nil
+	r.currentSpriteTexture.customTex1 = nil
+	r.currentSpriteTexture.customTex2 = nil
+
+	return r.grabTexture
+}
+
+// ------------------------------------------------------------------
+// VulkanAllocator implementation
+
+// computeMemoryTypeCacheKey combines memoryTypeBits and properties into a 64-bit cache key.
+func computeMemoryTypeCacheKey(memoryTypeBits uint32, properties vk.MemoryPropertyFlagBits) uint64 {
+	return (uint64(memoryTypeBits) << 32) | uint64(properties)
+}
+
+// recordOOMSnapshot captures allocator state at the point of an allocation failure.
+// Caller must hold allocator.mu.
+func (allocator *VulkanAllocator) recordOOMSnapshot(caller string, size, alignment vk.DeviceSize, properties vk.MemoryPropertyFlagBits, memTypeIdx, memTypeBits uint32, dedicated bool, vkErr error) {
+	var dedicatedBytes, suballocBytes vk.DeviceSize
+	for _, alloc := range allocator.allocations {
+		if alloc.dedicated {
+			dedicatedBytes += alloc.size
+		} else {
+			suballocBytes += alloc.size
+		}
+	}
+	allocator.lastOOM = VulkanOOMRecord{
+		FailedAt:           caller,
+		RequestedSize:      size,
+		RequestedAlign:     alignment,
+		RequestedProperty:  properties,
+		MemoryTypeIndex:    memTypeIdx,
+		MemoryTypeBits:     memTypeBits,
+		WasDedicated:       dedicated,
+		VulkanError:        vkErr.Error(),
+		HeapSize:           allocator.renderer.deviceLocalHeapSize,
+		TrackedDedicatedMB: float64(dedicatedBytes) / (1024 * 1024),
+		TrackedSuballocMB:  float64(suballocBytes) / (1024 * 1024),
+		BlockCount:         len(allocator.blocks),
+	}
+}
+
+// AllocateImageMemoryWithFallback allocates device memory for a VkImage with optional fallback.
+// When fallbackProperties != 0 and the primary allocation fails, a second attempt is made
+// using the fallback memory properties (typically HOST_VISIBLE | HOST_COHERENT).
+// Fallback allocations are always dedicated (no suballocation for HOST_VISIBLE memory).
+func (allocator *VulkanAllocator) AllocateImageMemoryWithFallback(img vk.Image, primaryProperties, fallbackProperties vk.MemoryPropertyFlagBits) (*VulkanAllocation, error) {
+	r := allocator.renderer
+
+	var memReq vk.MemoryRequirements
+	vk.GetImageMemoryRequirements(r.device, img, &memReq)
+
+	allocator.totalImageAllocations++
+	allocator.totalImageBytesRequested += uint64(memReq.Size)
+
+	allocator.mu.Lock()
+	defer allocator.mu.Unlock()
+
+	var alloc *VulkanAllocation
+	var primaryErr error
+
+	// --- Primary allocation attempt ---
+	primaryCacheKey := computeMemoryTypeCacheKey(memReq.MemoryTypeBits, primaryProperties)
+	primaryMemTypeIdx, ok := allocator.memoryTypeCache[primaryCacheKey]
+	if !ok {
+		var found bool
+		primaryMemTypeIdx, found = vk.FindMemoryTypeIndex(r.gpuDevices[r.gpuIndex], memReq.MemoryTypeBits, primaryProperties)
+		if !found {
+			// No compatible type for primary properties — skip primary, fall through to fallback.
+			primaryErr = fmt.Errorf("no compatible memory type for image (memoryTypeBits=0x%X, properties=%v)", memReq.MemoryTypeBits, primaryProperties)
+		} else {
+			allocator.memoryTypeCache[primaryCacheKey] = primaryMemTypeIdx
+		}
+	}
+
+	if primaryErr == nil {
+		if memReq.Size > allocator.smallImageThreshold {
+			// Dedicated allocation path for large images.
+			allocInfo := vk.MemoryAllocateInfo{
+				SType:           vk.StructureTypeMemoryAllocateInfo,
+				AllocationSize:  memReq.Size,
+				MemoryTypeIndex: primaryMemTypeIdx,
+			}
+			var deviceMemory vk.DeviceMemory
+			err := vk.Error(vk.AllocateMemory(r.device, &allocInfo, nil, &deviceMemory))
+			if err != nil {
+				primaryErr = err
+				allocator.recordOOMSnapshot("AllocateImageMemoryWithFallback(primary-dedicated)", memReq.Size, memReq.Alignment, primaryProperties, primaryMemTypeIdx, memReq.MemoryTypeBits, true, err)
+			} else {
+				err = vk.Error(vk.BindImageMemory(r.device, img, deviceMemory, 0))
+				if err != nil {
+					vk.FreeMemory(r.device, deviceMemory, nil)
+					return nil, fmt.Errorf("vk.BindImageMemory failed: %w", err)
+				}
+				alloc = &VulkanAllocation{
+					deviceMemory:    deviceMemory,
+					offset:          0,
+					size:            memReq.Size,
+					memoryTypeIndex: primaryMemTypeIdx,
+					memoryTypeBits:  memReq.MemoryTypeBits,
+					memProperties:   primaryProperties,
+					blockID:         0,
+					dedicated:       true,
+					isDeviceLocal:   primaryProperties&vk.MemoryPropertyDeviceLocalBit != 0,
+					isHostVisible:   primaryProperties&(vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit) != 0,
+				}
+			}
+		} else {
+			// Suballocated path for small images.
+			block, err := allocator.findOrCreateBlock(
+				memReq.MemoryTypeBits,
+				primaryProperties,
+				primaryMemTypeIdx,
+				memReq.Size,
+				memReq.Alignment,
+			)
+			if err != nil {
+				primaryErr = err
+				allocator.recordOOMSnapshot("AllocateImageMemoryWithFallback(primary-suballoc-block)", memReq.Size, memReq.Alignment, primaryProperties, primaryMemTypeIdx, memReq.MemoryTypeBits, false, err)
+			} else {
+				offset, found := block.findFreeRegion(memReq.Size, memReq.Alignment)
+				if !found {
+					primaryErr = fmt.Errorf("no free region in block %d for image of size %d", block.id, memReq.Size)
+					allocator.recordOOMSnapshot("AllocateImageMemoryWithFallback(primary-suballoc-nofit)", memReq.Size, memReq.Alignment, primaryProperties, primaryMemTypeIdx, memReq.MemoryTypeBits, false, primaryErr)
+				} else {
+					block.allocateFromFreeRegion(offset, memReq.Size)
+					err = vk.Error(vk.BindImageMemory(r.device, img, block.deviceMemory, offset))
+					if err != nil {
+						return nil, fmt.Errorf("vk.BindImageMemory (suballocated) failed: %w", err)
+					}
+					alloc = &VulkanAllocation{
+						deviceMemory:    block.deviceMemory,
+						offset:          offset,
+						size:            memReq.Size,
+						memoryTypeIndex: primaryMemTypeIdx,
+						memoryTypeBits:  memReq.MemoryTypeBits,
+						memProperties:   primaryProperties,
+						blockID:         block.id,
+						dedicated:       false,
+						isDeviceLocal:   primaryProperties&vk.MemoryPropertyDeviceLocalBit != 0,
+						isHostVisible:   primaryProperties&(vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit) != 0,
+					}
+				}
+			}
+		}
+	}
+
+	if alloc != nil {
+		allocator.allocations[img] = alloc
+		if alloc.isDeviceLocal {
+			r.totalImageBytesAllocated += alloc.size
+		}
+		return alloc, nil
+	}
+
+	// --- Primary failed; try fallback if configured ---
+	if fallbackProperties == 0 || !r.vramFallbackEnabled {
+		return nil, primaryErr
+	}
+
+	// Fallback: always dedicated, HOST_VISIBLE memory (no suballocation for host-visible).
+	fallbackCacheKey := computeMemoryTypeCacheKey(memReq.MemoryTypeBits, fallbackProperties)
+	fallbackMemTypeIdx, ok := allocator.memoryTypeCache[fallbackCacheKey]
+	if !ok {
+		var found bool
+		fallbackMemTypeIdx, found = vk.FindMemoryTypeIndex(r.gpuDevices[r.gpuIndex], memReq.MemoryTypeBits, fallbackProperties)
+		if !found {
+			return nil, fmt.Errorf("no compatible fallback memory type for image (memoryTypeBits=0x%X, properties=%v, primaryErr=%v)", memReq.MemoryTypeBits, fallbackProperties, primaryErr)
+		}
+		allocator.memoryTypeCache[fallbackCacheKey] = fallbackMemTypeIdx
+	}
+
+	fallbackAllocInfo := vk.MemoryAllocateInfo{
+		SType:           vk.StructureTypeMemoryAllocateInfo,
+		AllocationSize:  memReq.Size,
+		MemoryTypeIndex: fallbackMemTypeIdx,
+	}
+	var fallbackDeviceMemory vk.DeviceMemory
+	fallbackErr := vk.Error(vk.AllocateMemory(r.device, &fallbackAllocInfo, nil, &fallbackDeviceMemory))
+	if fallbackErr != nil {
+		allocator.recordOOMSnapshot("AllocateImageMemoryWithFallback(fallback)", memReq.Size, memReq.Alignment, fallbackProperties, fallbackMemTypeIdx, memReq.MemoryTypeBits, true, fallbackErr)
+		return nil, fmt.Errorf("fallback vk.AllocateMemory failed: %w", fallbackErr)
+	}
+	fallbackErr = vk.Error(vk.BindImageMemory(r.device, img, fallbackDeviceMemory, 0))
+	if fallbackErr != nil {
+		vk.FreeMemory(r.device, fallbackDeviceMemory, nil)
+		return nil, fmt.Errorf("fallback vk.BindImageMemory failed: %w", fallbackErr)
+	}
+
+	alloc = &VulkanAllocation{
+		deviceMemory:    fallbackDeviceMemory,
+		offset:          0,
+		size:            memReq.Size,
+		memoryTypeIndex: fallbackMemTypeIdx,
+		memoryTypeBits:  memReq.MemoryTypeBits,
+		memProperties:   fallbackProperties,
+		blockID:         0,
+		dedicated:       true,
+		isDeviceLocal:   false, // HOST_VISIBLE memory
+		isHostVisible:   true,  // mappable from host
+	}
+
+	if vkDebug {
+		LogMessage("[VRAM] fallback to HOST_VISIBLE allocation for image (bytes=%d)", memReq.Size)
+	}
+
+	allocator.allocations[img] = alloc
+	return alloc, nil
+}
+
+// AllocateImageMemory allocates device memory for a VkImage (no fallback).
+// Small images (≤ smallImageThreshold) are suballocated from shared blocks;
+// large images get dedicated allocations.
+func (allocator *VulkanAllocator) AllocateImageMemory(img vk.Image, memoryProperty vk.MemoryPropertyFlagBits) (*VulkanAllocation, error) {
+	return allocator.AllocateImageMemoryWithFallback(img, memoryProperty, 0)
+}
+
+// FreeImageAllocation releases device memory for a VkImage.
+// Dedicated allocations (blockID == 0) free vk memory directly;
+// suballocated allocations (blockID > 0) return the region to the block's free-list with coalescing.
+func (allocator *VulkanAllocator) FreeImageAllocation(img vk.Image, alloc *VulkanAllocation) {
+	allocator.mu.Lock()
+	defer allocator.mu.Unlock()
+
+	delete(allocator.allocations, img)
+
+	// Track device-local bytes for heuristic VRAM budget fallback.
+	if alloc.isDeviceLocal {
+		if allocator.renderer.totalImageBytesAllocated >= alloc.size {
+			allocator.renderer.totalImageBytesAllocated -= alloc.size
+		} else {
+			allocator.renderer.totalImageBytesAllocated = 0
+		}
+	}
+
+	if alloc.dedicated {
+		vk.FreeMemory(allocator.renderer.device, alloc.deviceMemory, nil)
+		return
+	}
+
+	// Suballocated: find owning block and return region to free-list.
+	for i, block := range allocator.blocks {
+		if block.id == alloc.blockID {
+			block.freeFromRegion(alloc.offset, alloc.size)
+			// Note: block.used is already decremented inside freeFromRegion.
+
+			if block.used == 0 {
+				vk.FreeMemory(allocator.renderer.device, block.deviceMemory, nil)
+				allocator.blocks = append(allocator.blocks[:i], allocator.blocks[i+1:]...)
+			}
+			return
+		}
+	}
+
+	// Block not found — should not happen under normal operation.
+}
+
+// AllocateBufferMemory allocates device memory for a VkBuffer (dedicated only)
+func (allocator *VulkanAllocator) AllocateBufferMemory(buffer vk.Buffer, memoryTypeBits uint32, properties vk.MemoryPropertyFlagBits) (*VulkanAllocation, error) {
+	r := allocator.renderer
+
+	var memReq vk.MemoryRequirements
+	vk.GetBufferMemoryRequirements(r.device, buffer, &memReq)
+
+	cacheKey := computeMemoryTypeCacheKey(memReq.MemoryTypeBits, properties)
+	memoryTypeIndex, ok := allocator.memoryTypeCache[cacheKey]
+	if !ok {
+		var found bool
+		memoryTypeIndex, found = vk.FindMemoryTypeIndex(r.gpuDevices[r.gpuIndex], memReq.MemoryTypeBits, properties)
+		if !found {
+			return nil, fmt.Errorf("no compatible memory type for buffer (memoryTypeBits=0x%X, properties=%v)", memReq.MemoryTypeBits, properties)
+		}
+		allocator.memoryTypeCache[cacheKey] = memoryTypeIndex
+	}
+
+	allocator.totalBufferAllocations++
+	allocator.totalBufferBytesRequested += uint64(memReq.Size)
+
+	// Buffer allocations are always dedicated (no suballocation).
+	allocInfo := vk.MemoryAllocateInfo{
+		SType:           vk.StructureTypeMemoryAllocateInfo,
+		AllocationSize:  memReq.Size,
+		MemoryTypeIndex: memoryTypeIndex,
+	}
+	var deviceMemory vk.DeviceMemory
+	err := vk.Error(vk.AllocateMemory(r.device, &allocInfo, nil, &deviceMemory))
+	if err != nil {
+		allocator.mu.Lock()
+		allocator.recordOOMSnapshot("AllocateBufferMemory", memReq.Size, memReq.Alignment, properties, memoryTypeIndex, memReq.MemoryTypeBits, true, err)
+		allocator.mu.Unlock()
+		err = fmt.Errorf("vk.AllocateMemory failed with %s", err)
+		return nil, err
+	}
+	err = vk.Error(vk.BindBufferMemory(r.device, buffer, deviceMemory, 0))
+	if err != nil {
+		err = fmt.Errorf("vk.BindBufferMemory failed with %s", err)
+		vk.FreeMemory(r.device, deviceMemory, nil)
+		return nil, err
+	}
+
+	// Create allocation tracking structure
+	alloc := &VulkanAllocation{
+		deviceMemory:    deviceMemory,
+		offset:          0,
+		size:            memReq.Size,
+		memoryTypeIndex: memoryTypeIndex,
+		memoryTypeBits:  memReq.MemoryTypeBits,
+		memProperties:   properties,
+		blockID:         0, // dedicated allocation
+		dedicated:       true,
+		isDeviceLocal:   false, // buffers use HOST_VISIBLE memory
+		isHostVisible:   true,  // mappable from host
+	}
+
+	return alloc, nil
+}

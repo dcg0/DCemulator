@@ -1,0 +1,68 @@
+name: Update Lua wiki page
+
+on:
+  push:
+    paths:
+      - src/script.go
+      - .github/scripts/generate_script_wiki.py
+      - .github/workflows/update-script-wiki.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-lua-wiki-page
+  cancel-in-progress: true
+
+jobs:
+  publish-wiki-page:
+    if: github.event_name == 'workflow_dispatch' || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    env:
+      WIKI_PAGE: Lua.md
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check out wiki repository
+        env:
+          GH_TOKEN: ${{ secrets.WIKI_PUSH_TOKEN }}
+          FALLBACK_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          token="${GH_TOKEN:-}"
+          if [ -z "$token" ]; then
+            token="$FALLBACK_TOKEN"
+          fi
+          git clone "https://x-access-token:${token}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki
+
+      - name: Verify target wiki page exists
+        run: |
+          test -f "wiki/${WIKI_PAGE}"
+
+      - name: Update Lua wiki page
+        run: |
+          python .github/scripts/generate_script_wiki.py \
+            --source src/script.go \
+            --wiki-page "wiki/${WIKI_PAGE}"
+
+      - name: Commit and push wiki update
+        working-directory: wiki
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${WIKI_PAGE}"
+          if git diff --cached --quiet; then
+            echo "No wiki changes detected."
+            exit 0
+          fi
+          git commit -m "docs(wiki): update Lua page API sections"
+          git push origin HEAD

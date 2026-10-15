@@ -1,0 +1,854 @@
+on:
+  push:
+    branches: [ develop, ci-test ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v1.0.0-rc.1). Leave empty to build the selected branch; develop builds nightly.'
+        type: string
+        required: false
+        default: ''
+      draft:
+        description: 'Set as a draft release.'
+        type: boolean
+        required: false
+        default: false
+      discussionCategory:
+        description: 'When provided this will generate a discussion of the specified category, e.g. Announcements.'
+        type: string
+        required: false
+        default: ''
+      buildAndroidApk:
+        description: 'Build Android APK.'
+        type: boolean
+        required: false
+        default: true
+      screenpackBranch:
+        description: 'Ikemen-GO-Screenpack branch to bundle. Leave empty for master.'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+name: releases
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  tag:
+    name: prepare tag
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      releaseTag: ${{ steps.meta.outputs.releaseTag }}
+      releaseName: ${{ steps.meta.outputs.releaseName }}
+      releaseKind: ${{ steps.meta.outputs.releaseKind }}
+      artifactVersion: ${{ steps.meta.outputs.artifactVersion }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      makeLatest: ${{ steps.meta.outputs.makeLatest }}
+      previousTag: ${{ steps.meta.outputs.previousTag }}
+      buildTime: ${{ steps.meta.outputs.buildTime }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Set version
+        id: meta
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          ref_name="$GITHUB_REF_NAME"
+          input_tag="${INPUT_TAG:-}"
+          previous_tag=""
+          release_name=""
+
+          if [ -n "$input_tag" ]; then
+            tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.([1-9][0-9]*))?$'
+            if [[ ! "$input_tag" =~ $tag_pattern ]]; then
+              echo "Invalid release tag: $input_tag" >&2
+              echo "Use vX.Y.Z or vX.Y.Z-rc.N." >&2
+              exit 1
+            fi
+
+            release_major="${BASH_REMATCH[1]}"
+            release_minor="${BASH_REMATCH[2]}"
+            release_patch="${BASH_REMATCH[3]}"
+            release_branch="release/${release_major}.${release_minor}"
+            if [ "$ref_name" != "$release_branch" ]; then
+              echo "Run $input_tag from the $release_branch branch." >&2
+              exit 1
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/$input_tag" >/dev/null 2>&1; then
+              echo "Tag $input_tag already exists and will not be replaced." >&2
+              exit 1
+            fi
+
+            git fetch --force --tags origin
+
+            # Order -rc.N before its stable release, as semver requires. Without
+            # this, git's version sort places v1.0.0 before v1.0.0-rc.1.
+            git config versionsort.suffix -rc.
+
+            latest_stable="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -Ev -- '-' | sed -n '1p' || true)"
+            if [[ "$input_tag" == *-rc.* ]]; then
+              base_tag="${input_tag%-rc.*}"
+              previous_tag="$(git tag --list "${base_tag}-rc.*" --sort=-v:refname | sed -n '1p')"
+            fi
+            if [ -z "$previous_tag" ]; then
+              # Patch releases compare against their own line first, so v1.0.1
+              # follows v1.0.0 rather than the newest release overall.
+              if [ "$release_patch" -gt 0 ]; then
+                previous_tag="$(git tag --list "v${release_major}.${release_minor}.*" --sort=-v:refname | grep -Ev -- '-' | sed -n '1p' || true)"
+              fi
+            fi
+            if [ -z "$previous_tag" ]; then
+              # Fall back to the newest stable overall. Reached by X.Y.0 releases,
+              # and by a patch whose own line has no stable tag yet.
+              previous_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -Ev -- '-' | sed -n '1p' || true)"
+            fi
+            if [ -z "$previous_tag" ]; then
+              # First ever release: fall back to the root commit so the changelog
+              # covers the whole history instead of coming out empty.
+              previous_tag="$(git rev-list --max-parents=0 HEAD | tail -1)"
+            fi
+            if [ -z "$previous_tag" ]; then
+              echo "Could not determine a previous tag for $input_tag." >&2
+              exit 1
+            fi
+
+            version="$input_tag"
+            release_tag="$input_tag"
+            artifact_version="$input_tag"
+            release_kind="tagged"
+            if [[ "$input_tag" == *-rc.* ]]; then
+              prerelease="false"
+              make_latest="true"
+            else
+              prerelease="false"
+              # Both operands are stable tags here (the -rc. case returns above),
+              # so sort -V is safe: it only misorders prerelease suffixes.
+              if [ -z "$latest_stable" ] || [ "$(printf '%s\n%s\n' "$latest_stable" "$input_tag" | sort -V | sed -n '$p')" = "$input_tag" ]; then
+                make_latest="true"
+              else
+                make_latest="false"
+              fi
+            fi
+          elif [ "$ref_name" = "ci-test" ]; then
+            version="ci-test"
+            release_tag="ci-test"
+            artifact_version="ci-test"
+            release_kind="ci-test"
+            prerelease="true"
+            make_latest="false"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+               [ "$ref_name" != "develop" ]; then
+            version="$ref_name"
+            artifact_version="$(printf '%s' "$ref_name" | sed 's#[^A-Za-z0-9._-]#-#g')"
+            # Prefix the tag so it can never collide with the branch it was built from.
+            release_tag="branch-$artifact_version"
+            release_name="$ref_name"
+            release_kind="branch"
+            prerelease="true"
+            make_latest="false"
+          else
+            version="nightly"
+            release_tag="nightly"
+            artifact_version="nightly"
+            release_kind="nightly"
+            prerelease="true"
+            make_latest="false"
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releaseTag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "releaseName=${release_name:-$release_tag}" >> "$GITHUB_OUTPUT"
+          echo "releaseKind=$release_kind" >> "$GITHUB_OUTPUT"
+          echo "artifactVersion=$artifact_version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "makeLatest=$make_latest" >> "$GITHUB_OUTPUT"
+          echo "previousTag=$previous_tag" >> "$GITHUB_OUTPUT"
+          echo "buildTime=$(date -u '+%Y.%m.%d')" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: prepare release
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    needs: tag
+    strategy:
+      matrix:
+        cfg:
+          - runner_os: windows
+            os: windows-2022
+            goos: windows
+            goarch: amd64
+            bin: Ikemen_GO.exe
+            build_target: Win64
+          - runner_os: linux
+            os: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            bin: Ikemen_GO_Linux
+            build_target: Linux
+          - runner_os: macos
+            os: macos-15
+            goos: darwin
+            goarch: arm64 # amd64
+            bin: Ikemen_GO_MacOSARM # Ikemen_GO_MacOS
+            # Minimum macOS for the binary. Go 1.27 needs 13+, arm64 needs 11+.
+            macos_min: '13.0'
+            build_target: MacOSARM # MacOS
+          - runner_os: android
+            os: ubuntu-24.04
+            goos: android
+            goarch: arm64
+            bin: ikemen-go.apk
+            build_target: Android
+          - runner_os: ios
+            # The ikemen-ios Xcode project needs Xcode 26 (default on macos-26).
+            os: macos-26
+            goos: ios
+            goarch: arm64
+            bin: ikemen-go.ipa
+            build_target: iOS
+    runs-on: ${{ matrix.cfg.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.x'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            **/go.sum
+
+      - name: Setup MSYS2 (Windows)
+        if: ${{ matrix.cfg.runner_os == 'windows' }}
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          path-type: inherit
+          install: >-
+            git
+            make
+            diffutils
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-bzip2
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-tools-git
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-yasm
+            mingw-w64-x86_64-libxmp
+      - name: Prepare Vulkan SDK
+        # iOS uses the headers bundled with the Vulkan bindings and MoltenVK from its release.
+        if: ${{ matrix.cfg.runner_os != 'ios' }}
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.304.1
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
+      - name: Install dependencies
+        if: ${{ matrix.cfg.runner_os != 'android' }}
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y libasound2-dev libgl1-mesa-dev xorg-dev libgtk-3-dev \
+              build-essential pkg-config git yasm nasm curl ca-certificates libxmp-dev libsdl2-dev \
+              cmake ninja-build libpulse-dev libudev-dev libwayland-dev wayland-protocols libxkbcommon-dev \
+              libdrm-dev libgbm-dev libdecor-0-dev libibus-1.0-dev
+          fi
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # iOS builds libxmp/FFmpeg/SDL2 for the device and takes MoltenVK from
+            # its release, so it only needs the host tools.
+            if [ "${{ matrix.cfg.runner_os }}" = "ios" ]; then
+              pkgs="pkg-config git nasm"
+            else
+              pkgs="pkg-config git nasm libxmp sdl2 molten-vk"
+            fi
+            # Avoid update, disable analytics, prefer taps over API, and retry.
+            export HOMEBREW_NO_ANALYTICS=1
+            export HOMEBREW_NO_AUTO_UPDATE=1
+            export HOMEBREW_NO_INSTALL_FROM_API=1
+            brew update-reset || true
+            ( brew install --quiet $pkgs ) || (
+              echo "First attempt failed; retrying with API mode..." >&2
+              unset HOMEBREW_NO_INSTALL_FROM_API
+              brew install --quiet $pkgs
+            )
+          fi
+          if [ "${{ matrix.cfg.runner_os }}" = "ios" ]; then
+            xcodebuild -version
+          fi
+
+      - name: Generate LICENSES.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # One LICENSES.txt for ALL platforms (including Android).
+          # Must exist BEFORE Android Docker Compose runs so it is visible in the bind-mounted workspace.
+          FFMPEG_REV="${FFMPEG_REV:-release/7.1}"
+          LIBVPX_REV="${LIBVPX_REV:-v1.15.2}"
+
+          SCREENPACK_BRANCH="${{ github.event.inputs.screenpackBranch || 'master' }}"
+          SCREENPACK_LIC="https://raw.githubusercontent.com/ikemen-engine/Ikemen-GO-Screenpack/${SCREENPACK_BRANCH}/LICENCE.txt"
+
+          FFMPEG_LGPL="https://raw.githubusercontent.com/FFmpeg/FFmpeg/${FFMPEG_REV}/COPYING.LGPLv2.1"
+          FFMPEG_LICENSE_MD="https://raw.githubusercontent.com/FFmpeg/FFmpeg/${FFMPEG_REV}/LICENSE.md"
+          FFMPEG_CREDITS="https://raw.githubusercontent.com/FFmpeg/FFmpeg/${FFMPEG_REV}/CREDITS"
+          LIBVPX_LICENSE="https://raw.githubusercontent.com/webmproject/libvpx/${LIBVPX_REV}/LICENSE"
+
+          LIBXMP_README="https://raw.githubusercontent.com/libxmp/libxmp/master/README"
+          SDL2_LICENSE="https://raw.githubusercontent.com/libsdl-org/SDL/main/LICENSE.txt"
+
+          {
+            echo "============================="
+            echo " Ikemen GO - LICENSES.txt"
+            echo "============================="
+            echo
+            echo "Section 1: Ikemen GO (MIT)"
+            echo "--------------------------"
+            cat LICENCE.txt
+            echo
+            echo "Section 2: Bundled Assets (Creative Commons)"
+            echo "-------------------------------------------"
+            echo "Screenpack license from Ikemen-GO-Screenpack/LICENCE.txt:"
+            echo
+            curl -fsSL "$SCREENPACK_LIC"
+            echo
+            echo "Section 3: FFmpeg (LGPL v2.1) and Notices"
+            echo "-----------------------------------------"
+            if [ "${{ matrix.cfg.runner_os }}" = "ios" ]; then
+              echo "This program statically links FFmpeg under the GNU Lesser General Public License v2.1."
+              echo "The complete source of Ikemen GO and of the iOS app (ikemen-ios) is public, so the"
+              echo "application can be rebuilt and relinked against a modified FFmpeg."
+            else
+              echo "This program dynamically links FFmpeg under the GNU Lesser General Public License v2.1."
+            fi
+            echo "The exact corresponding FFmpeg source is attached to the release page as:"
+            echo "  src_ffmpeg.tar.gz"
+            echo
+            echo "3.1 Full LGPL v2.1 license text:"
+            echo "--------------------------------"
+            curl -fsSL "$FFMPEG_LGPL"
+            echo
+            echo "3.2 FFmpeg LICENSE.md:"
+            echo "----------------------"
+            curl -fsSL "$FFMPEG_LICENSE_MD"
+            echo
+            echo "3.3 FFmpeg CREDITS:"
+            echo "-------------------"
+            curl -fsSL "$FFMPEG_CREDITS"
+            echo
+            echo "Section 4: libvpx and Notices"
+            echo "-----------------------------"
+            echo "libvpx is statically linked into the bundled FFmpeg libraries."
+            echo "Upstream: https://github.com/webmproject/libvpx"
+            echo
+            curl -fsSL "$LIBVPX_LICENSE"
+            echo
+            echo "Section 5: libxmp and Notices"
+            echo "-----------------------------"
+            echo "Upstream: https://github.com/libxmp/libxmp"
+            echo
+            echo "libxmp README (contains license info):"
+            echo "-------------------------------------"
+            curl -fsSL "$LIBXMP_README"
+            echo
+            echo "Section 6: SDL2 and Notices"
+            echo "---------------------------"
+            echo "Upstream: https://github.com/libsdl-org/SDL"
+            echo
+            echo "SDL2 LICENSE (zlib):"
+            echo "--------------------"
+            curl -fsSL "$SDL2_LICENSE"
+            echo
+          } > LICENSES.txt
+
+          if [ "${{ matrix.cfg.runner_os }}" = "ios" ]; then
+            # Same defaults build.sh uses, so the notices match what gets bundled.
+            bdef() { python3 -c 'import re,sys;print(re.search(r"^%s=\"\$\{%s:-(.*?)\}\"" % (sys.argv[1],sys.argv[1]), open("build/build.sh").read(), re.M).group(1))' "$1"; }
+            ios_repo="$(bdef IOS_APP_REPO)"; ios_repo="${ios_repo#https://github.com/}"; ios_repo="${ios_repo%.git}"
+            ios_ref="$(bdef IOS_APP_REF)"
+            mvk_rev="$(bdef MOLTENVK_REV)"
+            ios_raw="https://raw.githubusercontent.com/${ios_repo}/${ios_ref}"
+            zip_rev="$(curl -fsSL "$ios_raw/I.K.E.M.E.N-Go.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved" \
+              | python3 -c 'import json,sys;print(next(p["state"]["revision"] for p in json.load(sys.stdin)["pins"] if p["identity"]=="ziparchive"))')"
+            {
+              echo
+              echo "Section 7: iOS app components"
+              echo "-----------------------------"
+              echo "7.1 ikemen-ios wrapper (https://github.com/${ios_repo}):"
+              echo
+              curl -fsSL "$ios_raw/LICENSE.txt"
+              echo
+              echo "7.2 MoltenVK ${mvk_rev} (https://github.com/KhronosGroup/MoltenVK):"
+              echo
+              curl -fsSL "https://raw.githubusercontent.com/KhronosGroup/MoltenVK/${mvk_rev}/LICENSE"
+              echo
+              echo "7.3 ZipArchive (https://github.com/ZipArchive/ZipArchive):"
+              echo
+              curl -fsSL "https://raw.githubusercontent.com/ZipArchive/ZipArchive/${zip_rev}/LICENSE.txt"
+              echo
+            } >> LICENSES.txt
+          fi
+
+      - name: Build (POSIX)
+        if: ${{ runner.os != 'Windows' && matrix.cfg.runner_os != 'android' }}
+        shell: bash
+        env:
+          BUILD_FFMPEG: "yes"
+          # Linux only: keeps the archive off the runner's glibc.
+          BUILD_SDL2: ${{ matrix.cfg.runner_os == 'linux' && 'yes' || 'no' }}
+          GOOS: ${{ matrix.cfg.goos }}
+          GOARCH: ${{ matrix.cfg.goarch }}
+          CGO_ENABLED: "1"
+          APP_VERSION: ${{ needs.tag.outputs.version }}
+          APP_BUILDTIME: ${{ needs.tag.outputs.buildTime }}
+          # iOS: monotonically increasing CFBundleVersion so AltStore/SideStore detect updates.
+          IOS_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          # Pin the deployment target: cgo means external linking, so ld64 writes
+          # LC_BUILD_VERSION and honours MACOSX_DEPLOYMENT_TARGET (Go's -macos does not).
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "${{ matrix.cfg.macos_min }}" ]; then
+            export MACOSX_DEPLOYMENT_TARGET="${{ matrix.cfg.macos_min }}"
+            echo "MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+          fi
+          go env -w GO111MODULE=on
+          go mod download
+          ./build/build.sh ${{ matrix.cfg.build_target }}
+          if [ "${{ matrix.cfg.runner_os }}" = "ios" ]; then
+            test -f bin/libikemen.a
+            test -f "bin/${{ matrix.cfg.bin }}"
+            ls -lah bin/
+            echo "==> iOS minimum version recorded in app:"
+            unzip -p "bin/${{ matrix.cfg.bin }}" 'Payload/*.app/Info.plist' > /tmp/ios-Info.plist
+            /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' /tmp/ios-Info.plist
+          fi
+          if [ "${{ matrix.cfg.runner_os }}" = "macos" ]; then
+            make appbundle BINNAME=bin/${{ matrix.cfg.bin }}
+          fi
+          # Report the minimum OS actually recorded in the built binary.
+          if [ "${{ matrix.cfg.runner_os }}" = "macos" ]; then
+            echo "==> macOS minimum version recorded in binary:"
+            otool -l "bin/${{ matrix.cfg.bin }}" 2>/dev/null \
+              | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print "  minos "$2; exit}' \
+              || echo "  (otool unavailable)"
+          fi
+          # Report the highest glibc version actually required by the shipped ELFs.
+          # The Linux binary lands in ./ (macOS uses bin/), so check both.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "==> glibc requirements of shipped binaries:"
+            for f in "${{ matrix.cfg.bin }}" "bin/${{ matrix.cfg.bin }}" lib/*.so*; do
+              [ -f "$f" ] || continue
+              max=$(objdump -T "$f" 2>/dev/null | grep -oE "GLIBC_2\.[0-9]+(\.[0-9]+)?" \
+                | sort -uV | tail -1)
+              echo "  $f -> ${max:-none}"
+            done
+          fi
+
+      - name: Build Android (Docker Compose)
+        if: ${{ matrix.cfg.runner_os == 'android' && (github.event_name != 'workflow_dispatch' || github.event.inputs.buildAndroidApk != 'false') }}
+        shell: bash
+        env:
+          # Build APK is optional but enabled by default. If disabled, we skip this entire step.
+          BUILD_ANDROID_APK: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.buildAndroidApk != 'false') && '1' || '0' }}
+          APP_VERSION: ${{ needs.tag.outputs.version }}
+          APP_BUILDTIME: ${{ needs.tag.outputs.buildTime }}
+        run: |
+          set -euo pipefail
+          echo "==> Docker sanity:"
+          docker version
+          docker compose version
+          echo
+          echo "==> Building Android (APK via Docker Compose)..."
+          chmod +x build/build_android.sh
+          ./build/build_android.sh
+          echo
+          echo "==> Outputs:"
+          ls -lah bin/ lib/ || true
+          test -f bin/libmain.so
+          test -f bin/ikemen-go.apk
+
+      - name: Build (MSYS2)
+        if: ${{ runner.os == 'Windows' }}
+        shell: 'msys2 {0}'
+        env:
+          BUILD_FFMPEG: "yes"
+          GOOS: ${{ matrix.cfg.goos }}
+          GOARCH: ${{ matrix.cfg.goarch }}
+          CGO_ENABLED: "1"
+          APP_VERSION: ${{ needs.tag.outputs.version }}
+          APP_BUILDTIME: ${{ needs.tag.outputs.buildTime }}
+        run: |
+          go env -w GO111MODULE=on
+          go mod download
+          ./build/build.sh ${{ matrix.cfg.build_target }}
+
+      - name: Prepare FFmpeg artifacts
+        if: ${{ matrix.cfg.runner_os == 'linux' }}
+        id: artifacts_ffmpeg
+        shell: bash
+        run: |
+          # Android build runs in Docker and may create root-owned git dirs; allow them.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/build/ffmpeg-src" >/dev/null 2>&1 || true
+          mkdir -p FFmpeg-CS
+          # Export the *exact* tree
+          ( cd build/ffmpeg-src && git archive --format=tar HEAD ) | tar -x -C FFmpeg-CS
+          cp build/ffmpeg-src/config.h FFmpeg-CS/ 2>/dev/null || true
+          cp build/ffmpeg-src/config.log FFmpeg-CS/ 2>/dev/null || true
+          cp build/ffmpeg-src/BUILDINFO.txt FFmpeg-CS/ 2>/dev/null || true
+          tar -czf "src_ffmpeg.tar.gz" FFmpeg-CS
+          echo "artifact_ffsrc=src_ffmpeg.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release artifacts
+        if: ${{ matrix.cfg.runner_os != 'android' || (github.event_name != 'workflow_dispatch' || github.event.inputs.buildAndroidApk != 'false') }}
+        id: artifacts
+        shell: bash
+        run: |
+          echo "Preparing files for deployment"
+          mkdir -p deploy
+
+          if [ "${{ matrix.cfg.runner_os }}" = "android" ]; then
+            echo "==> Preparing Android release artifact"
+            mkdir -p deploy/lib
+            cp -av bin/ikemen-go.apk deploy/ || true
+            cp -av bin/libmain.so bin/libmain.h deploy/ 2>/dev/null || true
+            cp -av lib/*.so* deploy/lib/ 2>/dev/null || true
+            cp README.md deploy/ 2>/dev/null || true
+
+            cp -av LICENSES.txt deploy/ 2>/dev/null || true
+
+            cd deploy
+            if [ "${{ needs.tag.outputs.releaseKind }}" = "nightly" ]; then
+              ARTIFACT_NAME=Ikemen_GO-dev-android.zip
+              echo "artifact=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+            else
+              ARTIFACT_NAME=Ikemen_GO-${{ needs.tag.outputs.artifactVersion }}-android.zip
+              echo "artifact=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+            fi
+            zip -r ../$ARTIFACT_NAME *
+            echo "Successfully prepared Android assets for deployment"
+            exit 0
+          fi
+
+          if [ "${{ matrix.cfg.runner_os }}" = "ios" ]; then
+            # Shipped as a bare IPA (like other sideloaded iOS apps): AltStore/SideStore
+            # install directly from its URL. README and LICENSES.txt are inside the app.
+            echo "==> Preparing iOS release artifact"
+            if [ "${{ needs.tag.outputs.releaseKind }}" = "nightly" ]; then
+              ARTIFACT_NAME=Ikemen_GO-dev-ios.ipa
+            else
+              ARTIFACT_NAME=Ikemen_GO-${{ needs.tag.outputs.artifactVersion }}-ios.ipa
+            fi
+            cp -v "bin/${{ matrix.cfg.bin }}" "$ARTIFACT_NAME"
+            echo "artifact=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+
+            release_tag="${{ needs.tag.outputs.releaseTag }}"
+            python3 .github/scripts/generate_altstore_source.py \
+              --ipa "$ARTIFACT_NAME" \
+              --download-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${ARTIFACT_NAME}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --kind "${{ needs.tag.outputs.releaseKind }}" \
+              --release-tag "$release_tag" \
+              --output altstore-source.json
+            echo "Successfully prepared iOS assets for deployment"
+            exit 0
+          fi
+
+          mkdir -p deploy/data
+
+          # 1) Put binary and shared libs generated by build.sh
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cp -r I.K.E.M.E.N-Go.app deploy/
+            mkdir -p deploy/I.K.E.M.E.N-Go.app/Contents/Frameworks
+            if ls lib/*.dylib >/dev/null 2>&1; then
+              cp -av lib/*.dylib deploy/I.K.E.M.E.N-Go.app/Contents/Frameworks/ 2>/dev/null || true
+            fi
+          else
+            cp "./${{ matrix.cfg.bin }}" deploy/
+            mkdir -p deploy/lib
+            cp -r lib/* deploy/lib/ 2>/dev/null || true
+          fi
+
+          # 2) Bring in runtime assets
+          SCREENPACK_BRANCH="${{ github.event.inputs.screenpackBranch || 'master' }}"
+          git clone --branch "$SCREENPACK_BRANCH" --single-branch https://github.com/ikemen-engine/Ikemen-GO-Screenpack.git
+          cp -r data font external \
+                Ikemen-GO-Screenpack/chars \
+                Ikemen-GO-Screenpack/data \
+                Ikemen-GO-Screenpack/font \
+                Ikemen-GO-Screenpack/sound \
+                Ikemen-GO-Screenpack/stages \
+                Ikemen-GO-Screenpack/video \
+                deploy/
+
+          # Pack editable Screenpack sources as a separate release asset.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            (
+              cd Ikemen-GO-Screenpack
+              zip -9 -rq ../work.zip work
+            )
+          fi
+
+          # 3) Include readme
+          cp README.md deploy/
+
+          # 4) Single LICENSES.txt
+          cp -av LICENSES.txt deploy/ 2>/dev/null || true
+
+          # 5) Extra runtime db
+          GAMEPAD_DB_URL="https://raw.githubusercontent.com/mdqinc/SDL_GameControllerDB/refs/heads/master/gamecontrollerdb.txt"
+          echo "Downloading SDL GameController DB..."
+          curl -L "$GAMEPAD_DB_URL" -o deploy/external/gamecontrollerdb.txt
+
+          # 6) system.base.def
+          cp src/resources/defaultMotif.ini deploy/data/system.base.def
+
+          # 7) Archive
+          echo "Zipping deploy directory"
+          cd deploy
+
+          # Linux desktop integration: ship .desktop + 256px icon
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            #mkdir -p icons/hicolor/256x256/apps
+            #cp ../external/icons/IkemenCylia_256.png icons/hicolor/256x256/apps/ikemen-go.png
+            cp ../external/icons/IkemenCylia_256.png ikemen-go.png
+            cat > Ikemen_GO.desktop <<'EOF'
+          [Desktop Entry]
+          Name=Ikemen GO
+          Comment=An open-source fighting game engine
+          TryExec=Ikemen_GO_Linux
+          Exec=./Ikemen_GO_Linux
+          Icon=ikemen-go.png
+          Terminal=false
+          Type=Application
+          Categories=Game;ArcadeGame;
+          EOF
+          fi
+
+          if [ "${{ needs.tag.outputs.releaseKind }}" = "nightly" ]; then
+            ARTIFACT_NAME=Ikemen_GO-dev-${{ matrix.cfg.runner_os }}.zip
+            echo "artifact=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          else
+            ARTIFACT_NAME=Ikemen_GO-${{ needs.tag.outputs.artifactVersion }}-${{ matrix.cfg.runner_os }}.zip
+            echo "artifact=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            "/c/Program Files/7-Zip/7z.exe" a ../$ARTIFACT_NAME *
+          else
+            cp ../build/Ikemen_GO.command .
+            zip -r ../$ARTIFACT_NAME *
+          fi
+          echo "Successfully prepared assets for deployment"
+
+      - name: Stage release artifacts
+        if: ${{ steps.artifacts.outputs.artifact != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+
+          cp -v "${{ steps.artifacts.outputs.artifact }}" release-files/
+
+          if [ "${{ matrix.cfg.runner_os }}" = "linux" ] && \
+             [ -n "${{ steps.artifacts_ffmpeg.outputs.artifact_ffsrc }}" ]; then
+            cp -v "${{ steps.artifacts_ffmpeg.outputs.artifact_ffsrc }}" release-files/
+          fi
+
+          if [ "${{ matrix.cfg.runner_os }}" = "linux" ]; then
+            cp -v work.zip release-files/
+          fi
+
+          if [ "${{ matrix.cfg.runner_os }}" = "ios" ]; then
+            cp -v altstore-source.json release-files/
+          fi
+
+      - name: Upload release artifacts
+        if: ${{ steps.artifacts.outputs.artifact != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.cfg.runner_os }}
+          path: release-files/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    needs: [tag, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source for rolling tag update
+        if: ${{ needs.tag.outputs.releaseKind == 'nightly' || needs.tag.outputs.releaseKind == 'ci-test' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: source
+
+      - name: Check out source for release notes
+        if: ${{ needs.tag.outputs.releaseKind == 'tagged' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          # Full history and tags are required to walk the range between the
+          # previous tag and this commit.
+          fetch-depth: 0
+          fetch-tags: true
+          path: notes-source
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          find release-assets -maxdepth 1 -type f -print -exec ls -lh {} \;
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd release-assets && sha256sum * > SHA256SUMS.txt)
+
+      - name: Move rolling tag to this commit
+        if: ${{ needs.tag.outputs.releaseKind == 'nightly' || needs.tag.outputs.releaseKind == 'ci-test' }}
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tag="${{ needs.tag.outputs.releaseTag }}"
+          git fetch --force --tags origin
+          git tag -fa "$tag" "$GITHUB_SHA" -m "$tag: $GITHUB_SHA"
+          git push --force origin "refs/tags/$tag:refs/tags/$tag"
+
+      - name: Recreate rolling release metadata
+        if: ${{ needs.tag.outputs.releaseKind == 'nightly' || needs.tag.outputs.releaseKind == 'ci-test' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.IKEMEN_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # The rolling tag has already been force-moved after all builds succeeded.
+          # Delete only the GitHub Release object so it is recreated with fresh metadata.
+          # Do not use --cleanup-tag, because that would delete the moved tag too.
+          tag="${{ needs.tag.outputs.releaseTag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+
+      - name: Prepare nightly release notes
+        if: ${{ needs.tag.outputs.releaseKind == 'nightly' }}
+        shell: bash
+        run: |
+          cat > nightly-release.md <<'EOF'
+          The nightly release is generated after each commit to `develop` and contains the newest engine and screenpack files. It is intended for testing and may contain regressions or changes not yet covered by the stable documentation.
+          EOF
+
+      - name: Prepare RC release notes
+        if: ${{ needs.tag.outputs.releaseKind == 'tagged' && needs.tag.outputs.prerelease == 'false' && contains(needs.tag.outputs.releaseTag, '-rc.') }}
+        shell: bash
+        run: |
+          cat > rc-prefix.md <<'EOF'
+          ## What is a Release Candidate?
+
+          **RC** stands for **Release Candidate**. This version has undergone testing and is considered nearly ready for the final stable release. The purpose of an RC is to identify regressions and stabilize the build before the final release.
+
+          ## How to Help Test
+
+          - **Report bugs** on the [Issues](https://github.com/ikemen-engine/Ikemen-GO/issues) page
+          - **Check if the bug existed in the previous stable release** (e.g., v0.99.0) — this helps us determine priority
+          - **Regressions** (bugs introduced since the last stable release) are blockers and receive the `regression` label
+          - Bugs that existed in previous versions are lower priority and may be deferred to future releases
+
+          ---
+
+          EOF
+
+      - name: Generate tagged release notes
+        if: ${{ needs.tag.outputs.releaseKind == 'tagged' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.IKEMEN_TOKEN }}
+        working-directory: notes-source
+        run: |
+          set -euo pipefail
+          prefix=""
+          if [ -f "$GITHUB_WORKSPACE/rc-prefix.md" ]; then
+            prefix="$GITHUB_WORKSPACE/rc-prefix.md"
+          fi
+          python3 .github/scripts/generate_release_notes.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --previous-tag "${{ needs.tag.outputs.previousTag }}" \
+            --tag "${{ needs.tag.outputs.releaseTag }}" \
+            --head "$GITHUB_SHA" \
+            --output "$GITHUB_WORKSPACE/release-notes.md" \
+            --prefix "$prefix"
+
+      - name: Publish release
+        uses: ncipollo/release-action@v1.21.0
+        with:
+          token: ${{ secrets.IKEMEN_TOKEN }}
+
+          artifactErrorsFailBuild: true
+          artifacts: "release-assets/*"
+          commit: ${{ github.sha }}
+          tag: ${{ needs.tag.outputs.releaseTag }}
+          name: ${{ needs.tag.outputs.releaseName }}
+
+          # Rolling and temporary releases may be updated.
+          # Tagged RC/stable releases are immutable.
+          allowUpdates: ${{ needs.tag.outputs.releaseKind != 'tagged' }}
+          replacesArtifacts: ${{ needs.tag.outputs.releaseKind != 'tagged' }}
+          immutableCreate: ${{ needs.tag.outputs.releaseKind == 'tagged' && !inputs.draft }}
+
+          prerelease: ${{ needs.tag.outputs.prerelease }}
+          makeLatest: ${{ needs.tag.outputs.makeLatest }}
+
+          # Notes for tagged releases are generated by
+          # .github/scripts/generate_release_notes.py, which resolves cherry-picked
+          # commits back to their original pull requests. GitHub's built-in
+          # generator cannot do that and produces empty notes on release branches.
+          generateReleaseNotes: false
+
+          # Nightly uses a custom body; tagged releases use the generated notes
+          # (with the RC preamble already prepended by the generator).
+          bodyFile: ${{ needs.tag.outputs.releaseKind == 'nightly' && 'nightly-release.md' || (needs.tag.outputs.releaseKind == 'tagged' && 'release-notes.md') || '' }}
+
+          # These settings apply only to manually dispatched temporary or
+          # versioned releases. They evaluate to empty/false for rolling builds.
+          discussionCategory: ${{ (needs.tag.outputs.releaseKind == 'branch' || needs.tag.outputs.releaseKind == 'tagged') && inputs.discussionCategory || '' }}
+          draft: ${{ (needs.tag.outputs.releaseKind == 'branch' || needs.tag.outputs.releaseKind == 'tagged') && inputs.draft }}
+
+          # Preserve manually edited rolling/temporary release metadata when
+          # updating an existing release.
+          omitBodyDuringUpdate: ${{ needs.tag.outputs.releaseKind == 'branch' }}
+          omitDraftDuringUpdate: ${{ needs.tag.outputs.releaseKind != 'tagged' }}
+          omitNameDuringUpdate: ${{ needs.tag.outputs.releaseKind != 'tagged' }}
+          omitPrereleaseDuringUpdate: ${{ needs.tag.outputs.releaseKind != 'tagged' }}
+
+          removeArtifacts: false
+          skipIfReleaseExists: false
+          updateOnlyUnreleased: false

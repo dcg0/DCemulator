@@ -1,0 +1,2007 @@
+package main
+
+import (
+	"archive/zip"
+	"bytes"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"gopkg.in/ini.v1"
+
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/transform"
+)
+
+const (
+	IMax = int32(^uint32(0) >> 1)
+	IErr = ^IMax
+)
+
+func Random() int32 {
+	w := sys.randseed / 127773
+	sys.randseed = (sys.randseed-w*127773)*16807 - w*2836
+	if sys.randseed <= 0 {
+		sys.randseed += IMax - Btoi(sys.randseed == 0)
+	}
+	return sys.randseed
+}
+
+func Srand(s int32) {
+	sys.randseed = s
+}
+
+func Rand(min, max int32) int32 {
+	return min + Random()/(IMax/(max-min+1)+1)
+}
+
+func RandF32(min, max float32) float32 {
+	return min + float32(Random())/(float32(IMax)/(max-min+1.0)+1.0)
+}
+
+func RandI(x, y int32) int32 {
+	if y < x {
+		if uint32(x-y) > uint32(IMax) {
+			return int32(int64(y) + int64(Random())*(int64(x)-int64(y))/int64(IMax))
+		}
+		return Rand(y, x)
+	}
+	if uint32(y-x) > uint32(IMax) {
+		return int32(int64(x) + int64(Random())*(int64(y)-int64(x))/int64(IMax))
+	}
+	return Rand(x, y)
+}
+
+func RandF(x, y float32) float32 {
+	return x + float32(Random())*(y-x)/float32(IMax)
+}
+
+func Min[T int | int32 | int64 | float32 | float64](args ...T) (min T) {
+	for i, x := range args {
+		if i == 0 || x < min {
+			min = x
+		}
+	}
+	return
+}
+
+func Max[T int | int32 | int64 | float32 | float64](args ...T) (max T) {
+	for i, x := range args {
+		if i == 0 || x > max {
+			max = x
+		}
+	}
+	return
+}
+
+func Clamp[T int | int32 | int64 | float32 | float64](val, low, high T) T {
+	if val < low {
+		return low
+	}
+	if val > high {
+		return high
+	}
+	return val
+}
+
+func Rad(f float32) float32 {
+	return float32(f * math.Pi / 180)
+}
+
+func Deg(f float32) float32 {
+	return float32(f * 180 / math.Pi)
+}
+
+func Cos(f float32) float32 {
+	return float32(math.Cos(float64(f)))
+}
+
+func Sin(f float32) float32 {
+	return float32(math.Sin(float64(f)))
+}
+
+func Sign[T int | int32 | int64 | float32 | float64](val T) (sig T) {
+	if val < 0 {
+		return -1
+	} else if val > 0 {
+		return 1
+	}
+	return 0
+}
+
+func Abs[T int | int32 | int64 | float32 | float64](val T) (res T) {
+	if val < 0 {
+		return -val
+	}
+	return val
+}
+
+func Pow(x, y float32) float32 {
+	// Fast path for the hottest cases
+	switch y {
+	case 0:
+		return 1
+	case 1:
+		return x
+	case 2:
+		return x * x
+	case 3:
+		p := float64(x)
+		return float32(p * p * p)
+	case 4:
+		p := float64(x)
+		p *= p
+		return float32(p * p)
+	}
+	// General-purpose fallback
+	return float32(math.Pow(float64(x), float64(y)))
+}
+
+func Lerp(x, y, a float32) float32 {
+	//return float32(x + (y - x) * Clamp(a, 0, 1))
+	return float32((1-a)*x + a*y)
+}
+
+func Ceil(x float32) int32 {
+	return int32(math.Ceil(float64(x)))
+}
+
+func Floor(x float32) int32 {
+	return int32(math.Floor(float64(x)))
+}
+
+func IsFinite(f float32) bool {
+	return math.Abs(float64(f)) <= math.MaxFloat64
+}
+
+func IsNumeric(s string) bool {
+	_, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	return err == nil
+}
+
+// IsInt reports whether s is a valid base-10 integer literal (optional +/-).
+func IsInt(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if s[0] == '+' || s[0] == '-' {
+		s = s[1:]
+	}
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func Atoi(str string) int32 {
+	var n int64
+	str = strings.TrimSpace(str)
+	if len(str) > 0 {
+		var a string
+		if str[0] == '-' || str[0] == '+' {
+			a = str[1:]
+		} else {
+			a = str
+		}
+		// Negative side allows one more (-2147483648 is a valid int32)
+		limit := int64(math.MaxInt32)
+		if str[0] == '-' {
+			limit++
+		}
+		for i := range a {
+			if a[i] < '0' || '9' < a[i] {
+				break
+			}
+			n = n*10 + int64(a[i]-'0')
+			if n > limit {
+				sys.appendToConsole(fmt.Sprintf("WARNING: Atoi conversion outside int32 range: %v", a[:i+1]))
+				LogMessage("Atoi conversion outside int32 range: %v", a[:i+1])
+				if str[0] == '-' {
+					return IErr
+				}
+				return IMax
+			}
+		}
+		if str[0] == '-' {
+			n *= -1
+		}
+	}
+	return int32(n)
+}
+
+func Atof(str string) float64 {
+	f := 0.0
+	str = strings.TrimSpace(str)
+	if len(str) > 0 {
+		var a string
+		if str[0] == '-' || str[0] == '+' {
+			a = str[1:]
+		} else {
+			a = str
+		}
+		i, p := 0, 0
+		for ; i < len(a); i++ {
+			if a[i] == '.' {
+				if p != 0 {
+					break
+				}
+				p = i + 1
+				continue
+			}
+			if a[i] < '0' || '9' < a[i] {
+				break
+			}
+			f = f*10 + float64(a[i]-'0')
+		}
+		e := 0.0
+		if i+1 < len(a) && (a[i] == 'e' || a[i] == 'E') {
+			j := i + 1
+			if a[j] == '-' || a[j] == '+' {
+				j++
+			}
+			for ; j < len(a) && '0' <= a[j] && a[j] <= '9'; j++ {
+				e = e*10 + float64(a[j]-'0')
+			}
+			if e != 0 {
+				if str[i+1] == '-' {
+					e *= -1
+				}
+				if p == 0 {
+					p = i
+				}
+			}
+		}
+		if p > 0 {
+			f *= math.Pow10(p - i + int(e))
+		}
+		if str[0] == '-' {
+			f *= -1
+		}
+	}
+	return f
+}
+
+func Atob(str string) bool {
+	b, err := strconv.ParseBool(str)
+	if err != nil {
+		return false
+	}
+	return b
+}
+
+func Itoa(n int) string {
+	return fmt.Sprintf("%d", n)
+}
+
+func RectRotate(rect [4]float32, pivot [2]float32, angle float32) [4][2]float32 {
+	x1, y1, x2, y2 := rect[0], rect[1], rect[2], rect[3]
+	corners := [4][2]float32{
+		{x1, y1},
+		{x2, y1},
+		{x2, y2},
+		{x1, y2},
+	}
+
+	rad := angle * math.Pi / 180.0
+	s, c := Sin(rad), Cos(rad)
+
+	var rotated [4][2]float32
+	for i, p := range corners {
+		tx := p[0] - pivot[0]
+		ty := p[1] - pivot[1]
+		rotated[i] = [2]float32{
+			c*tx - s*ty + pivot[0],
+			s*tx + c*ty + pivot[1],
+		}
+	}
+	return rotated
+}
+
+// Checks two rectangles (like Clsn) for intersection
+// TODO: Return overlap in world coordinates ([4]float32) so it can be used for more things
+func RectIntersect(rect1, rect2 [4]float32, angle1, angle2 float32, pivot1, pivot2 [2]float32) (bool, float32, float32) {
+	if angle1 == 0 && angle2 == 0 {
+		return RectIntersectAABB(rect1, rect2)
+	}
+	return RectIntersectSAT(rect1, rect2, pivot1, pivot2, angle1, angle2)
+}
+
+// Fast path for no rotation
+func RectIntersectAABB(rect1, rect2 [4]float32) (bool, float32, float32) {
+	left1, top1, right1, bottom1 := rect1[0], rect1[1], rect1[2], rect1[3]
+	left2, top2, right2, bottom2 := rect2[0], rect2[1], rect2[2], rect2[3]
+
+	// Standard AABB overlap.
+	overlapX := Min(right1, right2) - Max(left1, left2)
+	overlapY := Min(bottom1, bottom2) - Max(top1, top2)
+
+	// Zero-width case
+	// These are still a valid overlap in Mugen. A point can also intersect with a box
+	if overlapX == 0 && (left1 == right1 || left2 == right2) {
+		halfW1 := (right1 - left1) * 0.5
+		halfW2 := (right2 - left2) * 0.5
+		centerX1 := (left1 + right1) * 0.5
+		centerX2 := (left2 + right2) * 0.5
+		overlapX = (halfW1 + halfW2) - Abs(centerX1-centerX2)
+	}
+
+	// Zero‑height case
+	if overlapY == 0 && (top1 == bottom1 || top2 == bottom2) {
+		halfH1 := (bottom1 - top1) * 0.5
+		halfH2 := (bottom2 - top2) * 0.5
+		centerY1 := (top1 + bottom1) * 0.5
+		centerY2 := (top2 + bottom2) * 0.5
+		overlapY = (halfH1 + halfH2) - Abs(centerY1-centerY2)
+	}
+
+	if overlapX >= 0 && overlapY >= 0 {
+		return true, overlapX, overlapY
+	}
+
+	return false, 0, 0
+}
+
+// Slow path for rotated rectangles
+func RectIntersectSAT(rect1, rect2 [4]float32, pivot1, pivot2 [2]float32, angle1, angle2 float32) (bool, float32, float32) {
+	r1 := RectRotate(rect1, pivot1, angle1)
+	r2 := RectRotate(rect2, pivot2, angle2)
+
+	// SAT projection helper
+	projectionRange := func(rect [4][2]float32, nx, ny float32) (min, max float32) {
+		min = math.MaxFloat32
+		max = -math.MaxFloat32
+		for _, p := range rect {
+			proj := nx*p[0] + ny*p[1]
+			if proj < min {
+				min = proj
+			}
+			if proj > max {
+				max = proj
+			}
+		}
+		return
+	}
+
+	// Check a single axis
+	checkAxis := func(nx, ny float32) bool {
+		minA, maxA := projectionRange(r1, nx, ny)
+		minB, maxB := projectionRange(r2, nx, ny)
+		if maxA < minB || maxB < minA {
+			return false
+		}
+		return true
+	}
+
+	// Check axes of rect1
+	for i := range r1 {
+		p1 := r1[i]
+		p2 := r1[(i+1)%4]
+		if !checkAxis(p2[1]-p1[1], p1[0]-p2[0]) {
+			return false, 0, 0
+		}
+	}
+
+	// Check axes of rect2
+	for i := range r2 {
+		p1 := r2[i]
+		p2 := r2[(i+1)%4]
+		if !checkAxis(p2[1]-p1[1], p1[0]-p2[0]) {
+			return false, 0, 0
+		}
+	}
+
+	// If we get here, the rectangles do overlap
+	// Compute AABB of the rotated rectangles
+	getBounds := func(rect [4][2]float32) (minX, maxX, minY, maxY float32) {
+		minX, maxX = math.MaxFloat32, -math.MaxFloat32
+		minY, maxY = math.MaxFloat32, -math.MaxFloat32
+		for _, p := range rect {
+			if p[0] < minX {
+				minX = p[0]
+			}
+			if p[0] > maxX {
+				maxX = p[0]
+			}
+			if p[1] < minY {
+				minY = p[1]
+			}
+			if p[1] > maxY {
+				maxY = p[1]
+			}
+		}
+		return
+	}
+
+	minX1, maxX1, minY1, maxY1 := getBounds(r1)
+	minX2, maxX2, minY2, maxY2 := getBounds(r2)
+
+	// Return overlap as distances. TODO: Return as rectangle
+	overlapX := Min(maxX1, maxX2) - Max(minX1, minX2)
+	overlapY := Min(maxY1, maxY2) - Max(minY1, minY2)
+
+	return true, overlapX, overlapY
+}
+
+// Prevent overflow errors when converting float64 to int32
+func F64toI32(f float64) int32 {
+	if f >= float64(math.MaxInt32) {
+		return math.MaxInt32
+	}
+	if f <= float64(math.MinInt32) {
+		return math.MinInt32
+	}
+	return int32(f)
+}
+
+func readDigit(d string) (int32, bool) {
+	if len(d) == 0 || (len(d) >= 2 && d[0] == '0') {
+		return 0, false
+	}
+	for _, c := range d {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	return int32(Atof(d)), true
+}
+
+func Btoi(b bool) int32 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func I32ToI16(i32 int32) int16 {
+	if i32 < ^int32(^uint16(0)>>1) {
+		return ^int16(^uint16(0) >> 1)
+	}
+	if i32 > int32(^uint16(0)>>1) {
+		return int16(^uint16(0) >> 1)
+	}
+	return int16(i32)
+}
+
+func I32ToU16(i32 int32) uint16 {
+	if i32 < 0 {
+		return 0
+	}
+	if i32 > int32(^uint16(0)) {
+		return ^uint16(0)
+	}
+	return uint16(i32)
+}
+
+func RoundFloat(val float64, precision int) float64 {
+	factor := math.Pow(10, float64(precision))
+	return math.Round(val*factor) / factor
+}
+
+func NormalizeNewlines(input string) string {
+	// Replace CRLF (\r\n) with LF (\n)
+	input = strings.ReplaceAll(input, "\r\n", "\n")
+	// Replace any remaining CR (\r) with LF (\n)
+	input = strings.ReplaceAll(input, "\r", "\n")
+	return input
+}
+
+func LoadText(filename string) (string, error) {
+	rc, err := OpenFile(filename)
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+
+	bytes, err := io.ReadAll(rc)
+	if err != nil {
+		return "", err
+	}
+
+	if len(bytes) >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf { // UTF-8 BOM
+		return string(bytes[3:]), nil
+	}
+
+	return string(bytes), nil
+}
+
+func LoadINIText(text string, opts ini.LoadOptions) (*ini.File, error) {
+	return ini.LoadSources(opts, []byte(NormalizeNewlines(text)))
+}
+
+func LoadINIBytes(data []byte, opts ini.LoadOptions) (*ini.File, error) {
+	return LoadINIText(string(data), opts)
+}
+
+func LoadINIFile(filename string, opts ini.LoadOptions) (*ini.File, string, error) {
+	text, err := LoadText(filename)
+	if err != nil {
+		return nil, "", err
+	}
+	text = NormalizeNewlines(text)
+	iniFile, err := LoadINIText(text, opts)
+	return iniFile, text, err
+}
+
+func decodeShiftJIS(input string) string {
+	bytes := []byte(input)
+
+	if utf8.Valid(bytes) {
+		return input
+	}
+
+	decodedBytes, _, err := transform.Bytes(japanese.ShiftJIS.NewDecoder(), bytes)
+	if err != nil {
+		LogMessage("Warning: Failed to decode string as Shift_JIS, falling back to original. String: %s, Error: %v", input, err)
+		return input
+	}
+	return string(decodedBytes)
+}
+
+func FileExist(filename string) string {
+	filename = filepath.ToSlash(filename)
+	isZip, zipFilePath, pathInZip := IsZipPath(filename)
+	if isZip {
+		var actualZipFilePathOnDisk string
+		info, err := os.Stat(zipFilePath)
+		if err == nil && !info.IsDir() {
+
+			actualZipFilePathOnDisk = zipFilePath
+		} else if os.IsNotExist(err) || (info != nil && info.IsDir()) {
+			var pattern string
+			tempPattern := ""
+			for _, r := range zipFilePath {
+				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+					tempPattern += "[" + string(unicode.ToLower(r)) + string(unicode.ToUpper(r)) + "]"
+				} else {
+					tempPattern += string(r)
+				}
+			}
+			pattern = tempPattern
+
+			matches, _ := filepath.Glob(pattern)
+			if len(matches) > 0 {
+				// Ensure the found match is not a directory
+				infoMatch, errMatch := os.Stat(matches[0])
+				if errMatch == nil && !infoMatch.IsDir() {
+					actualZipFilePathOnDisk = matches[0]
+				} else {
+					return ""
+				}
+			} else {
+				return "" // Zip file not found by direct stat or glob
+			}
+		} else if err != nil {
+			return "" // Some other error stating the zip file
+		}
+		// At this point, actualZipFilePathOnDisk should be the correct path to the zip file.
+		// Now check if pathInZip is empty (meaning we only check for the zip file itself)
+		if pathInZip == "" {
+			return filepath.ToSlash(actualZipFilePathOnDisk)
+		}
+
+		// If pathInZip is specified, check for its existence within the archive
+		zr, err := zip.OpenReader(actualZipFilePathOnDisk)
+		if err != nil {
+			return "" // Cannot open zip
+		}
+		defer zr.Close()
+		pathInZipLower := strings.ToLower(pathInZip)
+		foundInZip := false
+		for _, f := range zr.File {
+			if strings.ToLower(filepath.ToSlash(f.Name)) == pathInZipLower {
+				foundInZip = true
+				break
+			}
+		}
+		if foundInZip {
+			// Return the logical path (original filename) if the file exists in the zip
+			return filename
+		}
+		return "" // File not found in zip
+	}
+	if info, err := os.Stat(filename); !os.IsNotExist(err) {
+		if info == nil || info.IsDir() {
+			return ""
+		}
+		return filepath.ToSlash(filename)
+	}
+	var pattern string
+	for _, r := range filename {
+		if r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' {
+			pattern += "[" + string(unicode.ToLower(r)) +
+				string(unicode.ToLower(r)+'A'-'a') + "]"
+		} else if r == '*' || r == '?' || r == '[' {
+			pattern += "\\" + string(r)
+		} else {
+			pattern += string(r)
+		}
+	}
+	if m, _ := filepath.Glob(pattern); len(m) > 0 {
+		info, _ := os.Stat(m[0])
+		if info != nil && !info.IsDir() {
+			return filepath.ToSlash(m[0])
+		}
+	}
+	return ""
+}
+
+// SearchFile searches for 'file' in 'dirs'.
+// 'dirs' elements are lookup roots: directory paths or logical paths to files such as .def files.
+// Optional defaultDirs are subdirectories checked under each root after direct lookup, e.g. "font/" or "sound/".
+func SearchFile(file string, dirs []string, defaultDirs ...string) string {
+	file = strings.TrimSpace(file)
+	if sc := strings.Index(file, ";"); sc >= 0 {
+		file = strings.TrimSpace(file[:sc])
+	}
+	file = strings.Replace(file, "\\", "/", -1)
+	if file == "" {
+		return ""
+	}
+	hasDirPrefix := func(file, dir string) bool {
+		file = strings.ToLower(filepath.ToSlash(file))
+		dir = strings.ToLower(filepath.ToSlash(dir))
+		return strings.HasPrefix(file, dir)
+	}
+	cleanDefaultDir := func(dir string) string {
+		dir = strings.TrimSpace(filepath.ToSlash(dir))
+		dir = strings.TrimPrefix(dir, "./")
+		if dir == "" {
+			return ""
+		}
+		if !strings.HasSuffix(dir, "/") {
+			dir += "/"
+		}
+		return dir
+	}
+	addUnique := func(ss []string, s string) []string {
+		for _, v := range ss {
+			if v == s {
+				return ss
+			}
+		}
+		return append(ss, s)
+	}
+	roots := dirs
+	var defaults []string
+	for _, dir := range defaultDirs {
+		if dir = cleanDefaultDir(dir); dir != "" {
+			defaults = addUnique(defaults, dir)
+		}
+	}
+	if len(roots) == 0 {
+		roots = []string{""}
+	}
+	seen := map[string]bool{}
+	try := func(candidate string) string {
+		candidate = filepath.ToSlash(candidate)
+		key := strings.ToLower(candidate)
+		if seen[key] {
+			return ""
+		}
+		seen[key] = true
+		return FileExist(candidate)
+	}
+	join := func(base, name string) string {
+		return joinSearchPath(base, name)
+	}
+	rootBases := func(root string) []string {
+		root = filepath.ToSlash(strings.TrimSpace(root))
+		if root == "" {
+			return []string{""}
+		}
+		if isZipCtx, zipFileCtx, pathInZipCtx := IsZipPath(root); isZipCtx {
+			baseDirInZip := filepath.ToSlash(filepath.Dir(pathInZipCtx))
+			if baseDirInZip == "." {
+				baseDirInZip = ""
+			}
+			return []string{join(zipFileCtx, baseDirInZip)}
+		}
+		if strings.HasSuffix(root, "/") {
+			return []string{strings.TrimSuffix(root, "/")}
+		}
+		base := filepath.ToSlash(filepath.Dir(root))
+		if base == "." {
+			base = ""
+		}
+		bases := []string{base}
+		if filepath.Ext(root) == "" {
+			bases = addUnique(bases, root)
+		}
+		return bases
+	}
+	if isZipFull, _, _ := IsZipPath(file); isZipFull {
+		if found := try(file); found != "" {
+			return found
+		}
+	}
+	if filepath.IsAbs(file) {
+		if found := try(file); found != "" {
+			return found
+		}
+	}
+	for _, root := range roots {
+		for _, base := range rootBases(root) {
+			if found := try(join(base, file)); found != "" {
+				return found
+			}
+			for _, d := range defaults {
+				if hasDirPrefix(file, d) {
+					continue
+				}
+				if found := try(join(base, filepath.Join(d, file))); found != "" {
+					return found
+				}
+			}
+		}
+	}
+	if found := try(file); found != "" {
+		return found
+	}
+	return file
+}
+
+func LoadFile(file *string, dirs []string, defaultDir string, load func(string) error) error {
+	// Allow optional quotes around paths
+	*file = strings.TrimSpace(*file)
+	if len(*file) >= 2 {
+		q := (*file)[0]
+		if (q == '"' || q == '\'') && (*file)[len(*file)-1] == q {
+			*file = (*file)[1 : len(*file)-1]
+		}
+	}
+	fp := SearchFile(*file, dirs, defaultDir)
+	if err := load(fp); err != nil {
+		if len(dirs) > 0 {
+			return Error(dirs[0] + ":\n" + fp + "\n" + err.Error())
+		}
+		return Error(fp + "\n" + err.Error())
+	}
+	*file = fp
+	return nil
+}
+
+// Splits a file path into directory and filename
+// Only used for non-critical operations such as error logging
+func SplitPath(p string) (dir, file string) {
+	// Replace backslashes with forward slashes
+	p = strings.ReplaceAll(p, "\\", "/")
+	// Split at last slash
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[:i+1], p[i+1:]
+	}
+	return "", p
+}
+
+func StripComment(s string) string {
+	if sc := strings.Index(s, ";"); sc >= 0 {
+		s = s[:sc]
+	}
+	return strings.TrimSpace(s)
+}
+
+// Split string on separator, and remove all
+// leading and trailing white space from each line
+func SplitAndTrim(str, sep string) (ss []string) {
+	ss = strings.Split(str, sep)
+	for i, s := range ss {
+		ss[i] = strings.TrimSpace(s)
+	}
+	return
+}
+
+func OldSprintf(f string, a ...interface{}) (s string) {
+	iIdx, lIdx, numVerbs := []int{}, []int{}, 0
+	for i := 0; i < len(f); i++ {
+		if f[i] == '%' {
+			i++
+			if i >= len(f) {
+				break
+			}
+			for ; i < len(f) && (f[i] == ' ' || f[i] == '0' ||
+				f[i] == '-' || f[i] == '+' || f[i] == '#'); i++ {
+			}
+			if i >= len(f) {
+				break
+			}
+			for ; i < len(f) && f[i] >= '0' && f[i] <= '9'; i++ {
+			}
+			if i >= len(f) {
+				break
+			}
+			if f[i] == '.' {
+				for i++; i < len(f) && f[i] >= '0' && f[i] <= '9'; i++ {
+				}
+				if i >= len(f) {
+					break
+				}
+			}
+			if f[i] == 'h' || f[i] == 'l' || f[i] == 'L' {
+				lIdx = append(lIdx, i)
+				i++
+			}
+			if f[i] == '%' {
+				continue
+			}
+			numVerbs++
+			if f[i] == 'i' || f[i] == 'u' {
+				iIdx = append(iIdx, i)
+			}
+		}
+	}
+	if len(iIdx) > 0 || len(lIdx) > 0 {
+		b := []byte(f)
+		for _, i := range iIdx {
+			b[i] = 'd'
+		}
+		for i := len(lIdx) - 1; i >= 0; i-- {
+			b = SliceDelete(b, lIdx[i])
+		}
+		f = string(b)
+	}
+	if len(a) > numVerbs {
+		a = a[:numVerbs]
+	}
+	return fmt.Sprintf(f, a...)
+}
+
+func SectionName(sec string) (string, string) {
+	if len(sec) == 0 || sec[0] != '[' {
+		return "", ""
+	}
+	sec = strings.TrimSpace(strings.SplitN(sec, ";", 2)[0])
+	if sec[len(sec)-1] != ']' {
+		return "", ""
+	}
+	sec = sec[1:strings.Index(sec, "]")]
+	var name string
+	i := strings.Index(sec, " ")
+	if i >= 0 {
+		name = sec[:i+1]
+		sec = sec[i+1:]
+	} else {
+		name = sec
+		sec = ""
+	}
+	return strings.ToLower(name), sec
+}
+
+func HasExtension(file, ext string) bool {
+	match, _ := regexp.MatchString(ext, filepath.Ext(strings.ToLower(file)))
+	return match
+}
+
+func sliceContains(s []string, str string, lower bool) bool {
+	if lower {
+		strings.ToLower(str)
+	}
+	for _, v := range s {
+		if lower {
+			strings.ToLower(v)
+		}
+		if v == str {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+func sliceInsertInt(array []int, value int, index int) []int {
+	return append(array[:index], append([]int{value}, array[index:]...)...)
+}
+
+func sliceRemoveInt(array []int, index int) []int {
+	return append(array[:index], array[index+1:]...)
+}
+
+func sliceMoveInt(array []int, srcIndex int, dstIndex int) []int {
+	value := array[srcIndex]
+	return sliceInsertInt(sliceRemoveInt(array, srcIndex), value, dstIndex)
+}
+*/
+
+// Unified function for the above. Accepts any value type
+func sliceMove[T any](array []T, srcIndex int, dstIndex int) []T {
+	if srcIndex == dstIndex {
+		return array
+	}
+	// Skip bounds check. Just panic if used wrong
+	value := array[srcIndex]
+	// Remove
+	array = append(array[:srcIndex], array[srcIndex+1:]...)
+	// Insert
+	return append(array[:dstIndex], append([]T{value}, array[dstIndex:]...)...)
+}
+
+func ParseIkemenVersion(versionStr string) [3]uint16 {
+	var ver [3]uint16
+	parts := SplitAndTrim(versionStr, ".")
+	for i, s := range parts {
+		if i >= len(ver) {
+			break
+		}
+		if v, err := strconv.ParseUint(s, 10, 16); err == nil {
+			ver[i] = uint16(v)
+		} else {
+			break
+		}
+	}
+	return ver
+}
+
+func ParseMugenVersion(versionStr string) [2]uint16 {
+	var ver [2]uint16
+	parts := SplitAndTrim(versionStr, ".")
+	for i, s := range parts {
+		if i >= len(ver) {
+			break
+		}
+		if v, err := strconv.ParseUint(s, 10, 16); err == nil {
+			ver[i] = uint16(v)
+		} else {
+			return [2]uint16{0, 5}
+		}
+	}
+	// Normalize everything except Mugen 1.0 and 1.1 to WinMugen.
+	if ver == [2]uint16{1, 0} || ver == [2]uint16{1, 1} {
+		return ver
+	}
+	return [2]uint16{0, 5}
+}
+
+type Error string
+
+func (e Error) Error() string {
+	return string(e)
+}
+
+// Replaces sys.errLog print calls because those only worked on Windows if Ikemen was built with a paired terminal
+func LogMessage(format string, a ...any) {
+	//now := time.Now().Format("15:04:05")
+	msg := fmt.Sprintf(format, a...)
+	//fmt.Fprintf(os.Stderr, "[%s] %s\n", now, msg)
+	fmt.Fprintf(os.Stderr, "%s\n", msg)
+}
+
+type IniSection map[string]string
+
+func NewIniSection() IniSection {
+	return IniSection(make(map[string]string))
+}
+
+// Replaces operators like "p1|p2" and "team*" with the appropriate single prefix like "p1"
+func resolveLifebarPrefixOperators(is IniSection, targetPrefix string, prefixBase string) IniSection {
+	// Fast path if no operators are used in the first place
+	hasOperators := false
+	for k := range is {
+		if strings.ContainsRune(k, '*') || strings.ContainsRune(k, '|') {
+			hasOperators = true
+			break
+		}
+	}
+	if !hasOperators {
+		return is
+	}
+
+	// If operators are used, use a temporary INI section so we can mutate it
+	out := NewIniSection()
+
+	// Normalize input strings just in case
+	targetPrefix = strings.ToLower(strings.TrimSpace(targetPrefix))
+	prefixBase = strings.ToLower(strings.TrimSpace(prefixBase))
+	targetPrefixNoDot := strings.TrimSuffix(targetPrefix, ".")
+
+	// Wildcard selector token
+	wildcardToken := prefixBase + "*"
+
+	// Helper to check if a grouped selector applies to the target
+	matchesTarget := func(selector string) bool {
+		selector = strings.ToLower(strings.TrimSpace(selector))
+		for _, token := range strings.Split(selector, "|") {
+			token = strings.TrimSpace(token)
+			if token == targetPrefixNoDot || token == wildcardToken {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Iterate original section once and decide what to do per key
+	for k, v := range is {
+		kl := strings.ToLower(strings.TrimSpace(k))
+
+		// Split at first dot
+		dot := strings.IndexByte(kl, '.')
+		if dot <= 0 {
+			// No dot present at all. Keep as-is
+			out[kl] = v
+			continue
+		}
+
+		selector := strings.ToLower(strings.TrimSpace(kl[:dot]))
+
+		switch {
+		case selector == wildcardToken:
+			// Wildcard selector ("p*" to "p1")
+			out[targetPrefix+kl[dot+1:]] = v
+		case strings.Contains(selector, "|") && matchesTarget(selector):
+			// Grouped selector ("p1|p3|p5" to "p1")
+			out[targetPrefix+kl[dot+1:]] = v
+		default:
+			// Everything else is preserved as-is
+			out[kl] = v
+		}
+	}
+
+	return out
+}
+
+func ReadIniSection(lines []string, i *int) (
+	is IniSection, name string, subname string) {
+	for ; *i < len(lines); (*i)++ {
+		name, subname = SectionName(lines[*i])
+		if len(name) > 0 {
+			(*i)++
+			break
+		}
+	}
+	if len(name) == 0 {
+		return
+	}
+	is = NewIniSection()
+	is.Parse(lines, i)
+	return
+}
+
+func (is IniSection) Parse(lines []string, i *int) {
+	for ; *i < len(lines); (*i)++ {
+		if len(lines[*i]) > 0 && lines[*i][0] == '[' {
+			break
+		}
+		line := strings.TrimSpace(strings.SplitN(lines[*i], ";", 2)[0])
+		ia := strings.IndexAny(line, "= \t")
+		if ia > 0 {
+			name := strings.ToLower(line[:ia])
+			var data string
+			ia = strings.Index(line, "=")
+			if ia >= 0 {
+				data = strings.TrimSpace(line[ia+1:])
+			}
+			_, ok := is[name]
+			if !ok {
+				is[name] = data
+			}
+		}
+	}
+}
+
+func (is IniSection) LoadFile(name string, dirs []string, defaultDir string,
+	load func(string) error) error {
+	str := is[name]
+	if len(str) == 0 {
+		return nil
+	}
+	return LoadFile(&str, dirs, defaultDir, load)
+}
+
+func (is IniSection) ReadI32(name string, out ...*int32) bool {
+	str := is[name]
+	if len(str) == 0 {
+		return false
+	}
+	for i, s := range strings.Split(str, ",") {
+		if i >= len(out) {
+			break
+		}
+		if s = strings.TrimSpace(s); len(s) > 0 {
+			*out[i] = Atoi(s)
+		}
+	}
+	return true
+}
+
+func (is IniSection) ReadF32(name string, out ...*float32) bool {
+	str := is[name]
+	if len(str) == 0 {
+		return false
+	}
+	for i, s := range strings.Split(str, ",") {
+		if i >= len(out) {
+			break
+		}
+		if s = strings.TrimSpace(s); len(s) > 0 {
+			*out[i] = float32(Atof(s))
+		}
+	}
+	return true
+}
+
+func (is IniSection) ReadBool(name string, out ...*bool) bool {
+	str := is[name]
+	if len(str) == 0 {
+		return false
+	}
+	for i, s := range strings.Split(str, ",") {
+		if i >= len(out) {
+			break
+		}
+		if s = strings.TrimSpace(s); len(s) > 0 {
+			*out[i] = Atoi(s) != 0
+		}
+	}
+	return true
+}
+
+func (is IniSection) readI32ForStage(name string, out ...*int32) bool {
+	str := is[name]
+	if len(str) == 0 {
+		return false
+	}
+	for i, s := range strings.Split(str, ",") {
+		if i >= len(out) {
+			break
+		}
+		if s = strings.TrimLeftFunc(s, unicode.IsSpace); len(s) > 0 {
+			*out[i] = Atoi(s)
+		}
+		if strings.IndexFunc(s, unicode.IsSpace) >= 0 {
+			break
+		}
+	}
+	return true
+}
+
+// This version only accepts the parameter if it has enough values
+func (is IniSection) readI32ForStageMinLength(name string, out ...*int32) bool {
+	str := is[name]
+	if len(str) == 0 {
+		return false
+	}
+	parts := strings.Split(is[name], ",")
+	// Also reject empty values
+	n := 0
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			n++
+		}
+	}
+	// Mugen is still lenient when it's being strict and won't reject parameters with excessive values
+	if n < len(out) {
+		LogMessage("WARNING: '%s' expected at least %d values but found only %d", name, len(out), n)
+		return false
+	}
+	// Use the normal path after validation
+	return is.readI32ForStage(name, out...)
+}
+
+func (is IniSection) readF32ForStage(name string, out ...*float32) bool {
+	str := is[name]
+	if len(str) == 0 {
+		return false
+	}
+	for i, s := range strings.Split(str, ",") {
+		if i >= len(out) {
+			break
+		}
+		if s = strings.TrimLeftFunc(s, unicode.IsSpace); len(s) > 0 {
+			*out[i] = float32(Atof(s))
+		}
+		if strings.IndexFunc(s, unicode.IsSpace) >= 0 {
+			break
+		}
+	}
+	return true
+}
+
+func (is IniSection) readI32CsvForStage(name string) (ary []int32) {
+	if str := is[name]; len(str) > 0 {
+		for _, s := range strings.Split(str, ",") {
+			if s = strings.TrimLeftFunc(s, unicode.IsSpace); len(s) > 0 {
+				ary = append(ary, Atoi(s))
+			}
+			if strings.IndexFunc(s, unicode.IsSpace) >= 0 {
+				break
+			}
+		}
+	}
+	return
+}
+
+func (is IniSection) readF32CsvForStage(name string) (ary []float32) {
+	if str := is[name]; len(str) > 0 {
+		for _, s := range strings.Split(str, ",") {
+			if s = strings.TrimLeftFunc(s, unicode.IsSpace); len(s) > 0 {
+				ary = append(ary, float32(Atof(s)))
+			}
+			if strings.IndexFunc(s, unicode.IsSpace) >= 0 {
+				break
+			}
+		}
+	}
+	return
+}
+
+// ReadAutoType reads a scalar INI value as a string, int32, or float32.
+// The bool reports whether the key exists; unquoted non-numeric values are invalid.
+func (is IniSection) ReadAutoType(name string) (any, bool, error) {
+	raw, ok := is[name]
+	if !ok {
+		return nil, false, nil
+	}
+
+	// Helper to print shared error
+	invalidValue := func() error {
+		return Error(fmt.Sprintf("%q value must be a quoted string or number", name))
+	}
+
+	// Get raw value
+	s := strings.TrimSpace(raw)
+
+	// Try string
+	if strings.ContainsRune(s, '"') {
+		if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+			return nil, true, invalidValue()
+		}
+		unquoted, err := strconv.Unquote(s)
+		if err != nil {
+			return nil, true, invalidValue()
+		}
+		return unquoted, true, nil
+	}
+
+	// Try int
+	if IsInt(s) {
+		return Atoi(s), true, nil
+	}
+
+	// Try float
+	// Parse like the compiler so a value compares equal to the same CNS literal.
+	if f, err := strconv.ParseFloat(s, 32); err == nil {
+		return float32(f), true, nil
+	}
+
+	// Invalid value
+	return nil, true, invalidValue()
+}
+
+func (is IniSection) ReadAutoTypeMap(dst map[string]TypedValue, kind string) error {
+	for key := range is {
+		value, ok, err := is.ReadAutoType(key)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		switch value := value.(type) {
+		case string:
+			dst[key] = TypedValue{Type: VT_String, Str: value}
+		case int32:
+			dst[key] = TypedValue{Type: VT_Int, Num: float64(value)}
+		case float32:
+			dst[key] = TypedValue{Type: VT_Float, Num: float64(value)}
+		default:
+			return Error(fmt.Sprintf("unsupported auto-typed value for %s key %q", kind, key))
+		}
+	}
+	return nil
+}
+
+func (is IniSection) getText(name string) (str string, ok bool, err error) {
+	str, ok = is[name]
+	if !ok {
+		return
+	}
+	if len(str) >= 2 && str[0] == '"' && str[len(str)-1] == '"' {
+		str = str[1 : len(str)-1]
+	} else {
+		err = Error("String not enclosed in \"")
+	}
+	return
+}
+
+type Layout struct {
+	offset     [2]float32
+	facing     int8
+	vfacing    int8
+	layerno    int16
+	scale      [2]float32
+	rot        Rotation
+	projection Projection
+	fLength    float32
+	xshear     float32
+	window     [4]int32
+}
+
+func newLayout(ln int16) *Layout {
+	return &Layout{
+		facing:     1,
+		vfacing:    1,
+		layerno:    ln,
+		scale:      [2]float32{1, 1},
+		projection: Projection_Orthographic,
+		fLength:    2048,
+	}
+}
+
+func ReadLayout(pre string, is IniSection, ln int16) *Layout {
+	l := newLayout(ln)
+	l.Read(pre, is)
+	return l
+}
+
+func (l *Layout) Read(pre string, is IniSection) {
+	is.ReadF32(pre+"offset", &l.offset[0], &l.offset[1])
+	if str := is[pre+"facing"]; len(str) > 0 {
+		if Atoi(str) < 0 {
+			l.facing = -1
+		} else {
+			l.facing = 1
+		}
+	}
+	if str := is[pre+"vfacing"]; len(str) > 0 {
+		if Atoi(str) < 0 {
+			l.vfacing = -1
+		} else {
+			l.vfacing = 1
+		}
+	}
+	ln := int32(l.layerno)
+	is.ReadI32(pre+"layerno", &ln)
+	l.layerno = I32ToI16(Min(2, ln))
+	is.ReadF32(pre+"scale", &l.scale[0], &l.scale[1])
+	is.ReadF32(pre+"angle", &l.rot.angle)
+	is.ReadF32(pre+"xangle", &l.rot.xangle)
+	is.ReadF32(pre+"yangle", &l.rot.yangle)
+	is.ReadF32(pre+"xshear", &l.xshear)
+	is.ReadF32(pre+"focallength", &l.fLength)
+	if str, ok := is[pre+"projection"]; ok {
+		switch strings.ToLower(strings.TrimSpace(str)) {
+		case "orthographic":
+			l.projection = Projection_Orthographic
+		case "perspective":
+			l.projection = Projection_Perspective
+		case "perspective2":
+			l.projection = Projection_Perspective2
+		}
+	}
+	if is.ReadI32(pre+"window", &l.window[0], &l.window[1], &l.window[2], &l.window[3]) {
+		if l.window[2] < l.window[0] {
+			l.window[2], l.window[0] = l.window[0], l.window[2]
+		}
+		if l.window[3] < l.window[1] {
+			l.window[3], l.window[1] = l.window[1], l.window[3]
+		}
+		l.window[2] -= l.window[0]
+		l.window[3] -= l.window[1]
+	} else {
+		l.window = sys.scrrect
+	}
+}
+
+// Calculates the fight screen window local coordinates into real screen pixels,
+// taking the FightAspect ratio into account
+func (l *Layout) calcLBRect(window [4]int32) [4]int32 {
+	if window[2] == sys.scrrect[2] && window[3] == sys.scrrect[3] {
+		return sys.scrrect
+	}
+
+	baseScale := float32(sys.scrrect[2]) / float32(sys.fightScreen.localcoord[0])
+	screenAspect := float32(sys.scrrect[2]) / float32(sys.scrrect[3])
+	fightAspect := sys.getFightAspect()
+	correction := fightAspect / screenAspect
+
+	x := float32(window[0]) * baseScale
+	y := (float32(window[1]) * baseScale) * correction
+	w := float32(window[2]) * baseScale
+	h := (float32(window[3]) * baseScale) * correction
+
+	return [4]int32{int32(x), int32(y), int32(w), int32(h)}
+}
+
+func (l *Layout) DrawFaceSprite(x, y float32, ln int16, s *Sprite, fx *PalFX, fscale float32, window *[4]int32) {
+	if l.layerno == ln && s != nil {
+		drawwindow := &sys.scrrect
+
+		if window != nil {
+			rect := l.calcLBRect(*window)
+			drawwindow = &rect
+		}
+		// TODO: test "phantom pixel"
+		if l.facing < 0 {
+			x += sys.fightScreen.fnt_scale * sys.fightScreen.scale
+		}
+		if l.vfacing < 0 {
+			y += sys.fightScreen.fnt_scale * sys.fightScreen.scale
+		}
+		if s.coldepth <= 8 && s.PalTex == nil {
+			s.PalTex = s.CachePalTex(s.Pal)
+		}
+		// Xshear offset correction
+		xshear := -l.xshear
+		xsoffset := xshear * (float32(s.Offset[1]) * l.scale[1] * fscale)
+
+		s.Draw(x+l.offset[0]*sys.fightScreen.scale-xsoffset, y+l.offset[1]*sys.fightScreen.scale,
+			l.scale[0]*float32(l.facing)*fscale, l.scale[1]*float32(l.vfacing)*fscale,
+			xshear, l.rot, int32(l.projection), l.fLength, fx, drawwindow)
+	}
+}
+
+func (l *Layout) DrawAnim(r *[4]int32, x, y, scl, xscl, yscl float32, ln int16, a *Animation, palfx *PalFX) {
+	// Skip blank animations
+	if a == nil || a.isBlank() {
+		return
+	}
+	if l.layerno == ln {
+		drawwindow := &sys.scrrect
+
+		if r != nil {
+			if r == &l.window {
+				rect := l.calcLBRect(*r)
+				drawwindow = &rect
+			} else {
+				drawwindow = r
+			}
+		}
+		// TODO: test "phantom pixel"
+		if l.facing < 0 {
+			x += sys.fightScreen.fnt_scale
+		}
+		if l.vfacing < 0 {
+			y += sys.fightScreen.fnt_scale
+		}
+		// Xshear offset correction
+		xshear := -l.xshear
+		xsoffset := xshear * (float32(a.spr.Offset[1]) * l.scale[1] * scl)
+
+		a.Draw(drawwindow, x+l.offset[0]-xsoffset, y+l.offset[1]+float32(sys.gameHeight-240),
+			scl, scl, (l.scale[0]*xscl)*float32(l.facing), (l.scale[0]*xscl)*float32(l.facing),
+			(l.scale[1]*yscl)*float32(l.vfacing), xshear, l.rot,
+			float32(sys.gameWidth-320)/2, [2]float32{0, 0},
+			palfx, 1, [2]float32{1, 1}, int32(l.projection), l.fLength, false, CustomShaderRenderData{})
+	}
+}
+
+func (l *Layout) DrawText(x, y, scl float32, ln int16,
+	text string, f *Fnt, b, a int32, palfx *PalFX, frgba [4]float32) {
+	if l.layerno == ln {
+		drawwindow := &sys.scrrect
+
+		if l.window != [4]int32{0, 0, 0, 0} {
+			rect := l.calcLBRect(l.window)
+			drawwindow = &rect
+		}
+		// TODO: test "phantom pixel"
+		if l.facing < 0 {
+			x += sys.fightScreen.fnt_scale
+		}
+		if l.vfacing < 0 {
+			y += sys.fightScreen.fnt_scale
+		}
+		// Xshear offset correction
+		xshear := -l.xshear
+		xsoffset := xshear * (float32(f.offset[1]) * l.scale[1] * scl)
+
+		f.Print(text, (x+l.offset[0]-xsoffset)*scl, (y+l.offset[1])*scl,
+			l.scale[0]*sys.fightScreen.fnt_scale*float32(l.facing)*scl,
+			l.scale[1]*sys.fightScreen.fnt_scale*float32(l.vfacing)*scl, xshear, l.rot,
+			int32(l.projection), l.fLength, b, a, drawwindow, palfx, frgba)
+	}
+}
+
+type AnimLayout struct {
+	anim  *Animation
+	lay   Layout
+	palfx *PalFX
+}
+
+func newAnimLayout(sff *Sff, ln int16) AnimLayout {
+	return AnimLayout{
+		anim:  newAnimation(sff, &sff.palList),
+		lay:   *newLayout(ln),
+		palfx: newPalFX(),
+	}
+}
+
+func ReadAnimLayout(pre string, is IniSection, sff *Sff, at AnimationTable, ln int16) AnimLayout {
+	al := newAnimLayout(sff, ln)
+	al.Read(pre, is, at, ln)
+	return al
+}
+
+func (al *AnimLayout) Read(pre string, is IniSection, at AnimationTable, ln int16) {
+	var g, n int32
+	if is.ReadI32(pre+"spr", &g, &n) {
+		al.anim.frames = []AnimFrame{*newAnimFrame()}
+		al.anim.frames[0].Group, al.anim.frames[0].Number = g, n
+		al.anim.mask = 0
+		al.lay = *newLayout(ln)
+	}
+	if is.ReadI32(pre+"anim", &n) {
+		if ani := at.get(n); ani != nil {
+			al.anim = ani
+			al.lay = *newLayout(ln)
+		}
+	}
+	ReadPalFX(pre+"palfx.", is, al.palfx)
+	al.lay.Read(pre, is)
+}
+
+func (al *AnimLayout) Reset() {
+	if al.anim != nil {
+		al.anim.Reset()
+	}
+}
+
+func (al *AnimLayout) Action() {
+	if al.palfx != nil {
+		al.palfx.step()
+	}
+	if al.anim != nil {
+		al.anim.Action()
+	}
+}
+
+func (al *AnimLayout) HasAnim() bool {
+	return al != nil && al.anim != nil && len(al.anim.frames) > 0
+}
+
+func (al *AnimLayout) Draw(x, y float32, layerno int16, scale float32) {
+	al.lay.DrawAnim(&al.lay.window, x, y, scale, 1, 1, layerno, al.anim, al.palfx)
+}
+
+func ReadPalFX(pre string, is IniSection, pfx *PalFX) {
+	pfx.clear()
+	pfx.time = -1
+
+	is.ReadI32(pre+"time", &pfx.time)
+	is.ReadI32(pre+"add", &pfx.add[0], &pfx.add[1], &pfx.add[2])
+	is.ReadI32(pre+"mul", &pfx.mul[0], &pfx.mul[1], &pfx.mul[2])
+	var s [4]int32
+	if is.ReadI32(pre+"sinadd", &s[0], &s[1], &s[2], &s[3]) {
+		if s[3] < 0 {
+			pfx.sinadd[0] = -s[0]
+			pfx.sinadd[1] = -s[1]
+			pfx.sinadd[2] = -s[2]
+			pfx.cycletime[0] = -s[3]
+		} else {
+			pfx.sinadd[0] = s[0]
+			pfx.sinadd[1] = s[1]
+			pfx.sinadd[2] = s[2]
+			pfx.cycletime[0] = s[3]
+		}
+	}
+	if is.ReadI32(pre+"sinmul", &s[0], &s[1], &s[2], &s[3]) {
+		if s[3] < 0 {
+			pfx.sinmul[0] = -s[0]
+			pfx.sinmul[1] = -s[1]
+			pfx.sinmul[2] = -s[2]
+			pfx.cycletime[1] = -s[3]
+		} else {
+			pfx.sinmul[0] = s[0]
+			pfx.sinmul[1] = s[1]
+			pfx.sinmul[2] = s[2]
+			pfx.cycletime[1] = s[3]
+		}
+	}
+	var s2 [2]int32
+	if is.ReadI32(pre+"sincolor", &s2[0], &s2[1]) {
+		if s2[1] < 0 {
+			pfx.sincolor = -s2[0]
+			pfx.cycletime[2] = -s2[1]
+		} else {
+			pfx.sincolor = s2[0]
+			pfx.cycletime[2] = s2[1]
+		}
+	}
+	if is.ReadI32(pre+"sinhue", &s2[0], &s2[1]) {
+		if s2[1] < 0 {
+			pfx.sinhue = -s2[0]
+			pfx.cycletime[3] = -s2[1]
+		} else {
+			pfx.sinhue = s2[0]
+			pfx.cycletime[3] = s2[1]
+		}
+	}
+	is.ReadBool(pre+"invertall", &pfx.invertall)
+	is.ReadI32(pre+"invertblend", &pfx.invertblend)
+	var n float32
+	if is.ReadF32(pre+"color", &n) {
+		pfx.color = n / 256
+	}
+	if is.ReadF32(pre+"hue", &n) {
+		pfx.hue = n / 512
+	}
+}
+
+type AnimTextSnd struct {
+	snd         [2]int32
+	text        FSText
+	animLayout  AnimLayout
+	displaytime int32
+	cnt         int32
+}
+
+func newAnimTextSnd(sff *Sff, ln int16) *AnimTextSnd {
+	return &AnimTextSnd{
+		snd:         [2]int32{-1},
+		animLayout:  newAnimLayout(sff, ln),
+		displaytime: -2,
+	}
+}
+
+func ReadAnimTextSnd(pre string, is IniSection,
+	sff *Sff, at AnimationTable, ln int16, f map[int]*Fnt) *AnimTextSnd {
+
+	ats := newAnimTextSnd(sff, ln)
+	ats.Read(pre, is, at, ln, f)
+	return ats
+}
+
+func (ats *AnimTextSnd) Read(pre string, is IniSection, at AnimationTable,
+	ln int16, f map[int]*Fnt) {
+	is.ReadI32(pre+"snd", &ats.snd[0], &ats.snd[1])
+	ats.text = *readFSText(pre, is, "", ln, f, 0)
+	ats.animLayout.lay = *newLayout(ln)
+	ats.animLayout.Read(pre, is, at, ln)
+	is.ReadI32(pre+"displaytime", &ats.displaytime)
+}
+
+func (ats *AnimTextSnd) Reset() {
+	ats.animLayout.Reset()
+	ats.cnt = 0
+	ats.text.resetTxtPfx()
+}
+
+func (ats *AnimTextSnd) Action() {
+	ats.animLayout.Action()
+	ats.cnt++
+	ats.text.step()
+}
+
+func (ats *AnimTextSnd) Draw(x, y float32, layerno int16, f map[int]*Fnt, scale float32) {
+	if ats.displaytime > 0 && ats.cnt > ats.displaytime {
+		return
+	}
+
+	// Draw animation if available
+	if ats.animLayout.anim != nil && len(ats.animLayout.anim.frames) > 0 {
+		ats.animLayout.Draw(x, y, layerno, scale)
+		return // Skip text
+	}
+
+	// Otherwise draw text
+	if ats.text.font[0] >= 0 && getFont(f, ats.text.font[0]) != nil && len(ats.text.text) > 0 {
+		ff := getFont(f, ats.text.font[0])
+		for k, v := range strings.Split(ats.text.text, "\\n") {
+			if ff == nil {
+				break
+			}
+			lineH := float32(ff.Size[1])*ats.text.lay.scale[1]*sys.fightScreen.fnt_scale +
+				float32(ff.Spacing[1])*ats.text.lay.scale[1]*sys.fightScreen.fnt_scale
+			ats.text.lay.DrawText(x, y+float32(k)*lineH,
+				scale, layerno, v, ff, ats.text.font[1], ats.text.font[2], ats.text.palfx, ats.text.frgba)
+		}
+	}
+}
+
+func (ats *AnimTextSnd) NoSound() bool {
+	return ats.snd[0] < 0
+}
+
+// Check if Draw() function is worth calling
+func (ats *AnimTextSnd) HasDrawable() bool {
+	hasAnim := ats.animLayout.anim != nil && len(ats.animLayout.anim.frames) > 0
+	hasText := ats.text.font[0] >= 0 && len(ats.text.text) > 0 && getFont(sys.fightScreen.fnt, ats.text.font[0]) != nil
+
+	return hasAnim || hasText
+}
+
+// In Mugen this returns true if the animation ends before "displaytime" is over
+// It seems like the current Ikemen behavior makes more sense however
+// https://github.com/ikemen-engine/Ikemen-GO/issues/1150
+func (ats *AnimTextSnd) End(dt int32, inf bool) bool {
+	anim := ats.animLayout.anim
+
+	// If displaytime is negative, rely on animation current state
+	if ats.displaytime < 0 {
+		if anim == nil || len(anim.frames) == 0 {
+			return true
+		}
+		if anim.loopend {
+			return true
+		}
+		if inf && anim.curelem == int32(len(anim.frames)-1) && anim.frames[anim.curelem].Time == -1 {
+			return true
+		}
+		return false
+	}
+
+	// Otherwise, use displaytime
+	return dt >= ats.displaytime
+}
+
+// compareNatural compares two strings using natural order
+func compareNatural(a, b string) bool {
+	re := regexp.MustCompile(`^([a-zA-Z_]+)(\d*)$`)
+
+	// Extract prefix and numeric parts for both strings
+	aMatches := re.FindStringSubmatch(a)
+	bMatches := re.FindStringSubmatch(b)
+
+	// If regex doesn't match, print warning and place non-matching items at the end
+	if aMatches == nil || bMatches == nil {
+		fmt.Printf("Warning: Skipping comparison for non-matching keys: '%s' vs '%s'\n", a, b)
+		return a < b // Default to lexicographic comparison to prevent panic
+	}
+
+	// Extract prefix and numeric part
+	aPrefix, aNumStr := aMatches[1], aMatches[2]
+	bPrefix, bNumStr := bMatches[1], bMatches[2]
+
+	// Compare prefixes lexicographically
+	if aPrefix != bPrefix {
+		return aPrefix < bPrefix
+	}
+
+	// Parse numeric part (default to 0 if empty)
+	return Atoi(aNumStr) < Atoi(bNumStr)
+}
+
+// SortedKeys returns the keys of the map sorted in natural order.
+// It works with any map where the key is a string.
+func SortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+
+	// Sort using natural order
+	sort.Slice(keys, func(i, j int) bool {
+		return compareNatural(keys[i], keys[j])
+	})
+
+	return keys
+}
+
+func IsZipPath(path string) (isZip bool, zipFilePath string, pathInZip string) {
+	path = filepath.ToSlash(path) // Normalize to forward slashes
+
+	// Try to find ".zip/" as a separator.
+	// This handles cases like "C:/path/to/archive.zip/internal/file.txt"
+	// or "chars/archive.zip/internal/file.txt"
+	idx := strings.Index(strings.ToLower(path), ".zip/")
+	if idx != -1 {
+		potentialZipPath := path[:idx+4]
+		zipFilePath = potentialZipPath
+		pathInZip = path[idx+5:]
+		isZip = true
+		return
+	}
+
+	// If no ".zip/" separator, check if the path itself ends with .zip
+	if strings.HasSuffix(strings.ToLower(path), ".zip") {
+		isZip = true
+		zipFilePath = path
+		pathInZip = ""
+		return
+	}
+
+	return false, "", ""
+}
+
+type zipMemFileReader struct {
+	reader     *bytes.Reader   // Reader for the in-memory content of the file in zip
+	zipArchive *zip.ReadCloser // The main zip archive reader
+}
+
+func (zmfr *zipMemFileReader) Read(p []byte) (n int, err error) {
+	return zmfr.reader.Read(p)
+}
+
+func (zmfr *zipMemFileReader) Seek(offset int64, whence int) (int64, error) {
+	return zmfr.reader.Seek(offset, whence)
+}
+
+func (zmfr *zipMemFileReader) Close() error {
+	// The bytes.Reader itself doesn't need closing, but we must close the main zip archive.
+	return zmfr.zipArchive.Close()
+}
+
+// joinSearchPath joins paths used by SearchFile without allowing a relative reference to escape a zip archive.
+func joinSearchPath(base, name string) string {
+	base = filepath.ToSlash(base)
+	name = filepath.ToSlash(name)
+	if isZip, zipFile, pathInZip := IsZipPath(base); isZip {
+		inner := path.Join("/", pathInZip, strings.TrimLeft(name, "/"))
+		inner = strings.TrimPrefix(inner, "/")
+		if inner == "" || inner == "." {
+			return zipFile
+		}
+		return zipFile + "/" + inner
+	}
+	if base == "" {
+		return name
+	}
+	return filepath.ToSlash(filepath.Join(base, name))
+}
+
+// OpenFile opens a regular file or a file within a zip archive.
+// For zip files, it reads the entire entry into memory to ensure full io.Seeker compatibility.
+// It returns an io.ReadSeekCloser that must be closed by the caller.
+func OpenFile(filename string) (io.ReadSeekCloser, error) {
+	filename = filepath.ToSlash(filename)
+	isZip, zipFilePath, pathInZip := IsZipPath(filename)
+	if isZip {
+		zr, err := zip.OpenReader(zipFilePath)
+		if err != nil {
+			f, err2 := os.Open(filename)
+			if err2 != nil {
+				return nil, fmt.Errorf("opening zip archive %s: %w", zipFilePath, err)
+			}
+			return f, nil
+		}
+
+		if pathInZip == "" {
+			zr.Close() // Close the main archive if we're not reading a specific file from it.
+			return nil, fmt.Errorf("path inside zip archive not specified for %s", filename)
+		}
+
+		var targetFile *zip.File
+		pathInZipLower := strings.ToLower(pathInZip)
+		for _, f := range zr.File {
+			if strings.ToLower(filepath.ToSlash(f.Name)) == pathInZipLower {
+				targetFile = f
+				break
+			}
+		}
+
+		if targetFile == nil {
+			zr.Close()
+			return nil, fmt.Errorf("file '%s' not found in zip archive '%s'", pathInZip, zipFilePath)
+		}
+
+		rc, err := targetFile.Open()
+		if err != nil {
+			zr.Close()
+			return nil, fmt.Errorf("opening file '%s' in zip archive '%s': %w", pathInZip, zipFilePath, err)
+		}
+
+		// Read the entire content of the zip file entry into memory
+		fileData, err := io.ReadAll(rc)
+		rc.Close() // Close the individual file reader from the zip entry
+		if err != nil {
+			zr.Close() // Close the main zip archive on error
+			return nil, fmt.Errorf("reading file '%s' from zip archive '%s': %w", pathInZip, zipFilePath, err)
+		}
+
+		// Create a bytes.Reader from the in-memory data
+		// *bytes.Reader implements io.ReadSeeker
+		bytesReader := bytes.NewReader(fileData)
+
+		// Return our custom wrapper that closes the main zip archive
+		return &zipMemFileReader{reader: bytesReader, zipArchive: zr}, nil
+	}
+
+	// Not a zip path, open as a normal file
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil // *os.File implements io.ReadSeekCloser
+}
+
+func LowercaseNoExtension(filename string) string {
+	basename := filepath.Base(filename)
+	ext := filepath.Ext(basename)
+	nameOnly := basename
+	if len(ext) > 0 {
+		nameOnly = basename[0 : len(basename)-len(ext)]
+	}
+	return strings.ToLower(nameOnly)
+}
+
+// Similar to slices.delete but more thorough because it also nils/zeroes the removed item
+func SliceDelete[T any](slice []T, i int) []T {
+	if i < 0 || i >= len(slice) {
+		return slice
+	}
+	copy(slice[i:], slice[i+1:])
+	var zero T
+	slice[len(slice)-1] = zero // This only matters for pointers
+	return slice[:len(slice)-1]
+}
+
+// Backport of slices.Grow for Go 1.20
+func SliceGrow[T any](slice []T, n int) []T {
+	if n -= cap(slice) - len(slice); n > 0 {
+		slice = append(slice[:cap(slice)], make([]T, n)...)[:len(slice)]
+	}
+	return slice
+}
+
+// Nils out all elements and returns a zero-length slice while preserving the underlying capacity
+// This is better than plain [:0] because we ensure data from previous characters is GC'd
+func PointerSliceReset[T any](slice []*T) []*T {
+	// Recover the whole capacity so we can deep clean it
+	slice = slice[:cap(slice)]
+	// Clear everything
+	for i := range slice {
+		slice[i] = nil
+	}
+	// Shrink back to zero length
+	return slice[:0]
+}
+
+// Recovers a ghosted pointer from the slice capacity if available. Otherwise appends a new one
+// Effectively makes the capacity work as a pool of items
+func RecoverOrAppend[T any](slicePtr *[]*T, clearFunc func(*T), newFunc func() *T) *T {
+	slice := *slicePtr
+
+	// Try to recover ghost
+	if len(slice) < cap(slice) {
+		ghost := slice[:len(slice)+1][len(slice)]
+
+		if ghost != nil {
+			// Found a valid ghost. Reslice to recover it
+			*slicePtr = slice[:len(slice)+1]
+
+			// Clean it up for reuse
+			clearFunc(ghost)
+
+			return ghost
+		}
+	}
+
+	// Create new one and append
+	item := newFunc()
+	*slicePtr = append(*slicePtr, item)
+	return item
+}
+
+// Ensures panics in a separate goroutine are caught and logged
+// Should be used in place of "go func()"
+func SafeGo(f func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Forward the panic to the main thread, where dialogs and shutdown are safe
+				sys.mainThreadTask <- func() {
+					panic(r)
+				}
+			}
+		}()
+		f()
+	}()
+}
+
+// Simple aspect ratio calculator that casts the inputs itself
+func CalculateAspect[T int | int32 | float32 | float64](w, h T) float32 {
+	return float32(w) / float32(h)
+}
+
+// Ensures a rectangle is represented as "left, top, right, bottom"
+func NormalizeRect[T int | int32 | int64 | float32 | float64](rect [4]T) [4]T {
+	if rect[0] > rect[2] {
+		rect[0], rect[2] = rect[2], rect[0]
+	}
+	if rect[1] > rect[3] {
+		rect[1], rect[3] = rect[3], rect[1]
+	}
+	return rect
+}

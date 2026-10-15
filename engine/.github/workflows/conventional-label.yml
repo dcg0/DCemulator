@@ -1,0 +1,32 @@
+on:
+  pull_request_target:
+    branches: [ develop, 'release/**' ]
+    types: [ opened, edited, reopened, synchronize ]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+name: conventional-release-labels
+jobs:
+  label:
+    name: PR label
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: bcoe/conventional-release-labels@v1
+        with:
+          token: '${{ secrets.GITHUB_TOKEN }}'
+          type_labels: >-
+            {"build": "PR: build",
+            "chore": "PR: chore",
+            "breaking": "PR: breaking",
+            "docs": "PR: docs",
+            "feat": "PR: feat",
+            "fix": "PR: fix",
+            "other": "PR: other",
+            "perf": "PR: perf",
+            "refactor": "PR: refactor",
+            "style": "PR: style",
+            "test": "PR: test"}

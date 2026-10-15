@@ -1,0 +1,583 @@
+//go:build android
+
+package main
+
+import (
+	"fmt"
+	"image"
+	colour "image/color"
+	//"image/draw"
+	"io"
+	"io/ioutil"
+	"os"
+
+	"github.com/golang/freetype"
+	"github.com/golang/freetype/truetype"
+	gl "github.com/leonkasovan/gl/v3.2/gles2"
+	"golang.org/x/image/font"
+	"golang.org/x/image/math/fixed"
+)
+
+type Font_GLES32 struct {
+	fontChar     map[rune]*character
+	ttf          *truetype.Font
+	scale        int32
+	windowWidth  int
+	windowHeight int
+	textures     []*TextureAtlas
+	color        color
+	shaderPalFX  ShaderPalFX
+	customShader CustomShaderRenderData
+}
+
+type FontRenderer_GLES32 struct {
+	shaderProgram *ShaderProgram_GLES32
+	vao           uint32
+	vbo           uint32
+}
+
+// Init sets up shaders, VAO, and VBO
+func (r *FontRenderer_GLES32) Init(renderer interface{}) {
+	mr := gfx.(*Renderer_GLES32)
+
+	// Configure GLES 3.2 shader
+	r.newProgram(300, vertexFontShader, fragmentFontShader)
+
+	// Register attributes
+	r.shaderProgram.RegisterAttributes("vert", "vertTexCoord")
+
+	// Configure VAO/VBO for texture quads
+	gl.GenVertexArrays(1, &r.vao)
+	gl.GenBuffers(1, &r.vbo)
+	mr.bindVertexArray(r.vao)
+	mr.bindBuffer(gl.ARRAY_BUFFER, r.vbo)
+
+	// Pre-allocate for maximum batch size
+	gl.BufferData(gl.ARRAY_BUFFER, MaxFontBatchSize*6*4*4, nil, gl.DYNAMIC_DRAW)
+
+	// Configure attributes
+	vLoc := uint32(r.shaderProgram.attributes["vert"])
+	gl.EnableVertexAttribArray(vLoc)
+	gl.VertexAttribPointer(vLoc, 2, gl.FLOAT, false, 4*4, gl.PtrOffset(0))
+
+	tLoc := uint32(r.shaderProgram.attributes["vertTexCoord"])
+	gl.EnableVertexAttribArray(tLoc)
+	gl.VertexAttribPointer(tLoc, 2, gl.FLOAT, false, 4*4, gl.PtrOffset(2*4))
+
+	// Unbind for safety
+	mr.bindVertexArray(0)
+	mr.bindBuffer(gl.ARRAY_BUFFER, 0)
+}
+
+// LoadFont builds the font structure
+func (r *FontRenderer_GLES32) LoadFont(file string, scale int32, windowWidth int, windowHeight int) (interface{}, error) {
+	fd, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer fd.Close()
+
+	f, err := r.LoadTrueTypeFont(fd, scale, 32, 127, LeftToRight)
+	if err != nil {
+		return nil, err
+	}
+	f.windowWidth = windowWidth
+	f.windowHeight = windowHeight
+	return f, nil
+}
+
+// SetColor allows you to set the text color to be used when you draw the text
+func (f *Font_GLES32) SetColor(red float32, green float32, blue float32, alpha float32) {
+	f.color.r = red
+	f.color.g = green
+	f.color.b = blue
+	f.color.a = alpha
+}
+
+func (f *Font_GLES32) SetPalFX(state ShaderPalFX) {
+	f.shaderPalFX = state
+}
+
+func (f *Font_GLES32) SetCustomShader(shader CustomShaderRenderData) {
+	f.customShader = shader
+}
+
+func (f *Font_GLES32) UpdateResolution(windowWidth int, windowHeight int) {
+	f.windowWidth = windowWidth
+	f.windowHeight = windowHeight
+}
+
+func (r *FontRenderer_GLES32) SetFontPipeline() {
+	mr := gfx.(*Renderer_GLES32)
+
+	// Do nothing if we were already using the font shader
+	if mr.program == r.shaderProgram.program {
+		return
+	}
+
+	mr.ChangeProgram(r.shaderProgram.program)
+
+	// Bind VAO
+	mr.bindVertexArray(r.vao)
+
+	// We need to bind VBO here as well
+	mr.bindBuffer(gl.ARRAY_BUFFER, r.vbo)
+}
+
+// Printf draws a string to the screen, takes a list of arguments like printf
+func (f *Font_GLES32) Printf(x, y float32, xscl, yscl float32, spacingXAdd float32,
+	align int32, blend bool, window [4]int32,
+	rxadd float32, rot Rotation, projectionMode int32, fLength float32, rcx, rcy float32,
+	fs string, argv ...interface{}) error {
+
+	text := fmt.Sprintf(fs, argv...)
+	indices := []rune(text)
+	r := gfx.(*Renderer_GLES32)
+	fr := gfxFont.(*FontRenderer_GLES32)
+
+	if len(indices) == 0 {
+		return nil
+	}
+
+	// Buffer to store vertex data for multiple glyphs
+	batchSize := Min(MaxFontBatchSize, int32(len(indices)))
+	batchVertices := make([]float32, 0, batchSize*6*4)
+
+	// Activate corresponding render state
+	program := fr.shaderProgram
+	custom := false
+	if f.customShader.name != "" {
+		if id, ok := r.customShaderMap[f.customShader.name]; ok {
+			if shader, ok := r.customShaders[id]; ok {
+				program = shader
+				custom = true
+			}
+		}
+	}
+	if custom {
+		// Like SetFontPipeline, but with the custom program. The glyph data lives in the font's VAO and VBO
+		r.currentProgram = program
+		r.ChangeProgram(program.program)
+		r.bindVertexArray(fr.vao)
+		r.bindBuffer(gl.ARRAY_BUFFER, fr.vbo)
+	} else {
+		fr.SetFontPipeline()
+	}
+
+	//setup blending mode
+	if blend {
+		r.EnableBlending(BlendAdd, BlendSrcAlpha, BlendOneMinusSrcAlpha)
+	} else {
+		r.DisableBlending()
+	}
+
+	//restrict drawing to a certain part of the window
+	r.EnableScissor(window[0], window[1], window[2], window[3])
+
+	// Setup Custom Shader
+	if custom {
+		w, h := float32(f.windowWidth), float32(f.windowHeight)
+		proj := gfx.OrthographicProjectionMatrix(0, w, h, 0, -1, 1)
+		identity := []float32{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}
+		r.SetUniformMatrix("projection", proj[:])
+		r.SetUniformMatrix("modelview", identity)
+
+		r.SetUniformISub(program.uniforms["tex"], 0) // Glyph atlas stays on unit 0
+		r.SetUniformI("isFlat", 0)
+		r.SetUniformI("isRgba", 1)
+		r.SetUniformI("mask", 0)
+		r.SetUniformI("isTrapez", 0)
+		r.SetUniformI("neg", int(Btoi(f.shaderPalFX.neg)))
+		r.SetUniformF("alpha", f.color.a)
+		r.SetUniformFv("add", f.shaderPalFX.add[:])
+		mult := []float32{f.shaderPalFX.mult[0] * f.color.r, f.shaderPalFX.mult[1] * f.color.g, f.shaderPalFX.mult[2] * f.color.b}
+		r.SetUniformFv("mult", mult)
+		r.SetUniformF("gray", f.shaderPalFX.gray)
+		r.SetUniformF("hue", f.shaderPalFX.hue)
+		r.SetUniformFv("tint", []float32{0, 0, 0, 0})
+
+		// Same engine-provided values RenderSprite gives custom shaders
+		if f.customShader.tex1 != nil {
+			gfx.SetTexture("tex1", f.customShader.tex1)
+		}
+		if f.customShader.tex2 != nil {
+			gfx.SetTexture("tex2", f.customShader.tex2)
+		}
+		f.customShader.setUniforms()
+	} else {
+		// Set texture location
+		r.SetUniformISub(program.uniforms["tex"], 0)
+
+		//set text color
+		r.SetUniformFSub(program.uniforms["textColor"], f.color.r, f.color.g, f.color.b, f.color.a)
+
+		// Set PalFX uniforms
+		r.SetUniformFSub(program.uniforms["palAdd"], f.shaderPalFX.add[0], f.shaderPalFX.add[1], f.shaderPalFX.add[2])
+		r.SetUniformFSub(program.uniforms["palMul"], f.shaderPalFX.mult[0], f.shaderPalFX.mult[1], f.shaderPalFX.mult[2])
+		r.SetUniformFSub(program.uniforms["palGray"], f.shaderPalFX.gray)
+		r.SetUniformFSub(program.uniforms["palHue"], f.shaderPalFX.hue)
+		r.SetUniformISub(program.uniforms["palNeg"], int32(Btoi(f.shaderPalFX.neg)))
+
+		//set screen resolution
+		r.SetUniformFSub(program.uniforms["resolution"], float32(f.windowWidth), float32(f.windowHeight))
+	}
+
+	// No explicit unit 0 activation needed anymore
+	//mr.bindVertexArray(gfxFont.(*FontRenderer_GLES32).vao)
+
+	//calculate alignment position
+	alignScale := xscl
+	if alignScale == 0 {
+		alignScale = yscl
+	}
+	if align == 0 {
+		x -= f.widthRunes(indices, alignScale, spacingXAdd) * 0.5
+	} else if align < 0 {
+		x -= f.widthRunes(indices, alignScale, spacingXAdd)
+	}
+	needsTransform := rxadd != 0 || !rot.IsZero()
+	textureID := int32(-1)
+	spacing := spacingXAdd * xscl
+	renderedAny := false
+	// Iterate through all characters in string
+	for i := range indices {
+		//get rune
+		runeIndex := indices[i]
+
+		//find rune in fontChar list
+		ch, ok := f.fontChar[runeIndex]
+
+		//load missing runes in batches of 32
+		if !ok {
+			low := runeIndex - (runeIndex % 32)
+			f.GenerateGlyphs(low, low+31)
+			ch, ok = f.fontChar[runeIndex]
+		}
+
+		//skip runes that are not in font character range
+		if !ok {
+			//fmt.Printf("%c %d\n", runeIndex, runeIndex)
+			continue
+		}
+
+		if int32(len(batchVertices)/24) >= batchSize || (textureID != -1 && textureID != int32(ch.textureID)) {
+			// Render the current batch
+			f.renderGlyphBatch(batchVertices, uint32(textureID))
+			// Clear the batch buffers
+			batchVertices = batchVertices[:0]
+		}
+		textureID = int32(ch.textureID)
+
+		if renderedAny {
+			x += spacing
+		}
+
+		//calculate position and size for current rune
+		//padding := float32(2)
+		xpos := x + float32(ch.bearingH)*xscl
+		//ypos := y - (float32(ch.height-ch.bearingV)-padding)*scale
+		ypos := y - float32(ch.height-ch.bearingV)*yscl
+		w := float32(ch.width) * xscl
+		h := float32(ch.height) * yscl
+
+		x1, y1 := xpos+w, ypos
+		x2, y2 := xpos, ypos
+		x3, y3 := xpos, ypos+h
+		x4, y4 := xpos+w, ypos+h
+		if needsTransform {
+			x1, y1, x2, y2, x3, y3, x4, y4 = transformTextQuad(
+				x1, y1, x2, y2, x3, y3, x4, y4,
+				rxadd, rot, projectionMode, fLength, rcx, rcy,
+			)
+		}
+
+		batchVertices = append(batchVertices,
+			x1, y1, ch.uv[2], ch.uv[1],
+			x2, y2, ch.uv[0], ch.uv[1],
+			x3, y3, ch.uv[0], ch.uv[3],
+
+			x3, y3, ch.uv[0], ch.uv[3],
+			x4, y4, ch.uv[2], ch.uv[3],
+			x1, y1, ch.uv[2], ch.uv[1],
+		)
+		// Now advance cursors for next glyph (note that advance is number of 1/64 pixels)
+		x += float32((ch.advance >> 6)) * xscl // Bitshift by 6 to get value in pixels (2^6 = 64 (divide amount of 1/64th pixels by 64 to get amount of pixels))
+		renderedAny = true
+	}
+
+	// Render any remaining glyphs in the batch
+	if len(batchVertices) > 0 {
+		f.renderGlyphBatch(batchVertices, uint32(textureID))
+	}
+
+	// Disable scissor just in case
+	r.DisableScissor()
+
+	return nil
+}
+
+func (f *Font_GLES32) widthRunes(indices []rune, scale float32, spacingXAdd float32) float32 {
+	if len(indices) == 0 {
+		return 0
+	}
+
+	spacing := spacingXAdd * scale
+	var width float32
+	renderedAny := false
+
+	// Iterate through all characters in string
+	for i := range indices {
+
+		//get rune
+		runeIndex := indices[i]
+
+		//find rune in fontChar list
+		ch, ok := f.fontChar[runeIndex]
+
+		//load missing runes in batches of 32
+		if !ok {
+			low := runeIndex - (runeIndex % 32)
+			f.GenerateGlyphs(low, low+31)
+			ch, ok = f.fontChar[runeIndex]
+		}
+
+		//skip runes that are not in font character range
+		if !ok {
+			//fmt.Printf("%c %d\n", runeIndex, runeIndex)
+			continue
+		}
+
+		if renderedAny {
+			width += spacing
+		}
+
+		// Now advance cursors for next glyph (note that advance is number of 1/64 pixels)
+		width += float32(ch.advance>>6) * scale // Bitshift by 6 to get value in pixels (2^6 = 64 (divide amount of 1/64th pixels by 64 to get amount of pixels))
+		renderedAny = true
+	}
+
+	return width
+}
+
+// Helper function to render a batch of glyphs
+func (f *Font_GLES32) renderGlyphBatch(vertices []float32, textureID uint32) {
+	fr := gfxFont.(*FontRenderer_GLES32)
+
+	mr := gfx.(*Renderer_GLES32)
+	mr.bindBuffer(gl.ARRAY_BUFFER, fr.vbo)
+	gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(vertices)*4, gl.Ptr(vertices))
+
+	// Sampling bind, safe to skip if this atlas is already bound
+	mr.bindTextureToUnit(0, gl.TEXTURE_2D, nil, textureID)
+	gl.DrawArrays(gl.TRIANGLES, 0, int32(len(vertices))/4)
+}
+
+func (r *FontRenderer_GLES32) ReleaseFontPipeline() {
+	mr := gfx.(*Renderer_GLES32)
+	mr.bindVertexArray(0)
+	mr.bindBuffer(gl.ARRAY_BUFFER, 0)
+}
+
+// Width returns the width of a piece of text in pixels
+func (f *Font_GLES32) Width(scale float32, spacingXAdd float32, fs string, argv ...interface{}) float32 {
+	return f.widthRunes([]rune(fmt.Sprintf(fs, argv...)), scale, spacingXAdd)
+}
+
+// GenerateGlyphs builds a set of textures based on a ttf files glyphs
+func (f *Font_GLES32) GenerateGlyphs(low, high rune) error {
+	//create a freetype context for drawing
+	c := freetype.NewContext()
+	c.SetDPI(72)
+	c.SetFont(f.ttf)
+	c.SetFontSize(float64(f.scale))
+	c.SetHinting(font.HintingFull)
+
+	//create new face to measure glyph dimensions
+	ttfFace := truetype.NewFace(f.ttf, &truetype.Options{
+		Size:    float64(f.scale),
+		DPI:     72,
+		Hinting: font.HintingFull,
+	})
+
+	// Add padding to prevent cropping
+	// https://github.com/ikemen-engine/Ikemen-GO/issues/3085
+	padding := 2
+
+	//make each glyph
+	for ch := low; ch <= high; ch++ {
+		char := new(character)
+
+		drawGlyph := true
+		gBnd, gAdv, ok := ttfFace.GlyphBounds(ch)
+		if !ok {
+			// Some fonts do not provide bounds for every requested rune. This is common for control chars.
+			// Keep loading the font and create an invisible placeholder so future lookups do not retry this glyph forever.
+			drawGlyph = false
+			if adv, advOK := ttfFace.GlyphAdvance(ch); advOK {
+				gAdv = adv
+			} else {
+				gAdv = 0
+			}
+			gBnd = f.ttf.Bounds(fixed.Int26_6(f.scale))
+		}
+
+		gh := int32((gBnd.Max.Y - gBnd.Min.Y) >> 6)
+		gw := int32((gBnd.Max.X - gBnd.Min.X) >> 6)
+
+		//if glyph has no dimensions set to a max value
+		if gw == 0 || gh == 0 {
+			gBnd = f.ttf.Bounds(fixed.Int26_6(f.scale))
+			gw = int32((gBnd.Max.X - gBnd.Min.X) >> 6)
+			gh = int32((gBnd.Max.Y - gBnd.Min.Y) >> 6)
+
+			//above can sometimes yield 0 for font smaller than 48pt, 1 is minimum
+			if gw == 0 || gh == 0 {
+				gw = 1
+				gh = 1
+			}
+		}
+
+		//The glyph's ascent and descent equal -bounds.Min.Y and +bounds.Max.Y.
+		gAscent := int(-gBnd.Min.Y) >> 6
+		gdescent := int(gBnd.Max.Y) >> 6
+
+		//set w,h and adv, bearing V and bearing H in char
+		//char.width = int(gw)
+		//char.height = int(gh)
+		char.width = int(gw) + (padding * 2)
+		char.height = int(gh) + (padding * 2)
+		char.advance = int(gAdv)
+		char.bearingV = gdescent
+		//char.bearingH = (int(gBnd.Min.X) >> 6)
+		char.bearingH = (int(gBnd.Min.X) >> 6) - padding
+
+		//create image to draw glyph
+		//fg, bg := image.NewUniform(colour.RGBA{255, 255, 255, 255}), image.NewUniform(colour.RGBA{0, 0, 0, 255}) // No need to fill in the background
+		fg := image.NewUniform(colour.RGBA{255, 255, 255, 255})
+		//rect := image.Rect(0, 0, int(gw)+padding*2, int(gh)+padding*2)
+		rect := image.Rect(0, 0, char.width, char.height)
+		rgba := image.NewRGBA(rect)
+		//draw.Draw(rgba, rgba.Bounds(), bg, image.ZP, draw.Src) // No need to fill in the background
+
+		//set the glyph dot
+		//px := 0 - (int(gBnd.Min.X) >> 6) + padding
+		//py := gAscent + padding
+		px := padding - (int(gBnd.Min.X) >> 6)
+		py := padding + gAscent
+		pt := freetype.Pt(px, py)
+
+		// Draw the text from mask to image
+		c.SetClip(rgba.Bounds())
+		c.SetDst(rgba)
+		c.SetSrc(fg)
+		if drawGlyph {
+			if _, err := c.DrawString(string(ch), pt); err != nil {
+				// Some fonts have broken hinting bytecode. Keep full hinting for normal fonts.
+				// Retry glyph without hinting instead of failing the whole font load.
+				c2 := freetype.NewContext()
+				c2.SetDPI(72)
+				c2.SetFont(f.ttf)
+				c2.SetFontSize(float64(f.scale))
+				c2.SetHinting(font.HintingNone)
+				c2.SetClip(rgba.Bounds())
+				c2.SetDst(rgba)
+				c2.SetSrc(fg)
+				if _, err := c2.DrawString(string(ch), pt); err != nil {
+					Logcat(fmt.Sprintf("GLES: ERROR DRAWING STRING: %v", err.Error()))
+					return err
+				}
+			}
+		}
+		// Logcat(fmt.Sprintf("Char: %c | Box: %dx%d | Dot: %v | Bounds: %v\n", ch, gw, gh, pt, gBnd))
+
+		var uv [4]float32
+		textureIndex := 0
+		w, h := int32(rgba.Rect.Dx()), int32(rgba.Rect.Dy())
+		pix := rgba.Pix
+		stride := int32(rgba.Stride) // This was added to unify desktop and Android
+
+		//char.width = rect.Dx()  // Use the actual image width (with padding)
+		//char.height = rect.Dy() // Use the actual image height (with padding)
+		//char.bearingH = (int(gBnd.Min.X) >> 6) - padding
+
+		for {
+			if textureIndex >= len(f.textures) {
+				f.textures = append(f.textures, CreateTextureAtlas(256, 256, 32, true))
+			}
+
+			var inserted bool
+			uv, inserted = f.textures[textureIndex].AddImage(w, h, stride, pix)
+
+			if inserted {
+				break
+			}
+
+			textureIndex++
+		}
+
+		texAtlas := f.textures[textureIndex]
+
+		// This block is no longer necessary after the padding fix and actually introduces blur
+		// aw := float32(texAtlas.width)
+		// ah := float32(texAtlas.height)
+		// off_u := 0.5 / aw
+		// off_v := 0.5 / ah
+		// uv[0] += off_u
+		// uv[1] += off_v
+		// uv[2] -= off_u
+		// uv[3] -= off_v
+
+		char.uv = uv
+		char.textureID = texAtlas.texture.(*Texture_GLES32).handle
+		// Logcat(fmt.Sprintf("GLES: Texture ID: %v", texAtlas.texture.(*Texture_GLES32).handle))
+
+		//add char to fontChar list
+		f.fontChar[ch] = char
+	}
+
+	gfx.(*Renderer_GLES32).bindTextureToUnit(0, gl.TEXTURE_2D, nil, 0)
+	return nil
+}
+
+// LoadTrueTypeFont builds OpenGL buffers and glyph textures based on a ttf file
+func (r *FontRenderer_GLES32) LoadTrueTypeFont(reader io.Reader, scale int32, low, high rune, dir Direction) (*Font_GLES32, error) {
+	data, err := ioutil.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read the truetype font.
+	ttf, err := truetype.Parse(data)
+	if err != nil && err.Error() == "freetype: invalid TrueType format: bad kern table length" {
+		ttf, err = truetype.Parse(stripKernTable(data))
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	//make Font stuct type
+	f := new(Font_GLES32)
+	f.fontChar = make(map[rune]*character)
+	f.ttf = ttf
+	f.scale = scale
+	f.SetColor(1.0, 1.0, 1.0, 1.0) //set default white
+	f.SetPalFX(NewShaderPalFX())
+	f.textures = append(f.textures, CreateTextureAtlas(256, 256, 32, true))
+
+	err = f.GenerateGlyphs(low, high)
+	if err != nil {
+		Logcat(fmt.Sprintf("Error generating glyphs: %v", err.Error()))
+		return nil, err
+	}
+
+	return f, nil
+}
+
+// newProgram links the frag and vertex shader programs
+func (r *FontRenderer_GLES32) newProgram(version uint, vertexSrc, fragmentSrc string) {
+	var err error
+	if r.shaderProgram, err = gfx.(*Renderer_GLES32).newShaderProgram(vertexSrc, fragmentSrc, "", "font shader", true); err != nil {
+		Logcat(fmt.Sprintf("Error loading font shader: %v", err.Error()))
+	}
+	r.shaderProgram.RegisterUniforms("textColor", "resolution", "tex", "palAdd", "palMul", "palGray", "palHue", "palNeg")
+}

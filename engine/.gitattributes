@@ -1,0 +1,42 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+*.sh text eol=lf
+*.command text eol=lf
+*.cmd text eol=crlf
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.ini text eol=lf
+*.yml text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.lua text eol=lf
+Dockerfile text eol=lf
+
+# Syntax
+*.def linguist-language=ini
+*.air linguist-language=ini
+*.st linguist-language=ini
+*.const linguist-language=ini
+*.zss linguist-language=coffeescript
+
+# Custom for Visual Studio
+*.cs     diff=csharp
+*.sln    merge=union
+*.csproj merge=union
+*.vbproj merge=union
+*.fsproj merge=union
+*.dbproj merge=union
+
+# Standard to msysgit
+*.doc	 diff=astextplain
+*.DOC	 diff=astextplain
+*.docx diff=astextplain
+*.DOCX diff=astextplain
+*.dot  diff=astextplain
+*.DOT  diff=astextplain
+*.pdf  diff=astextplain
+*.PDF	 diff=astextplain
+*.rtf	 diff=astextplain
+*.RTF	 diff=astextplain
+
