@@ -17,8 +17,8 @@ importers:
   .:
     dependencies:
       '@babylonjs/core':
-        specifier: ^9.28.0
-        version: 9.28.0
+        specifier: ^9.32.0
+        version: 9.32.0
       '@hookform/resolvers':
         specifier: ^5.2.2
         version: 5.2.2(react-hook-form@7.64.0(react@19.2.1))
@@ -335,8 +335,8 @@ packages:
     resolution: {integrity: sha512-bkFqkLhh3pMBUQQkpVgWDWq/lqzc2678eUyDlTBhRqhCHFguYYGM0Efga7tYk4TogG/3x0EEl66/OQ+WGbWB/Q==}
     engines: {node: '>=6.9.0'}
 
-  '@babylonjs/core@9.28.0':
-    resolution: {integrity: sha512-CrmxXdCQlXK6cq3ccL9yNcrasFVmU1lkT9mDsoaFcEJXGHxfxMfVmBjObr4OS0JdWP5sbH6oTymMsw89z4bjpQ==}
+  '@babylonjs/core@9.32.0':
+    resolution: {integrity: sha512-mHBsyKJuQHbs97Rb/1qxMRg6Ru79+0BjLhGLTa34s6U/fkBCtOh+xKTQDqFpFtPqgBw9TLFcIEvFHy01vnJxwA==}
 
   '@braintree/sanitize-url@7.1.1':
     resolution: {integrity: sha512-i1L7noDNxtFyL5DmZafWy1wRVhGehQmzZaz1HiN5e7iylJMSZR7ekOV7NsIqa5qBldlLrsKv4HbgFUVlQrz8Mw==}
@@ -3667,7 +3667,7 @@ snapshots:
       '@babel/helper-string-parser': 7.27.1
       '@babel/helper-validator-identifier': 7.27.1
 
-  '@babylonjs/core@9.28.0': {}
+  '@babylonjs/core@9.32.0': {}
 
   '@braintree/sanitize-url@7.1.1': {}
 
